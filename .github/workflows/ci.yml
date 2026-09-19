@@ -40,12 +40,12 @@ jobs:
     steps:
       # 1. 后端自身
       - name: Checkout backend
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # 2. 跨仓库拉取管理端、文档站与采访端源码。
       #    注意 admin / docs 目录此时是空的，后面才填充产物。
       - name: Checkout admin
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Smart-MZCMC/admin
           ref: main
@@ -53,7 +53,7 @@ jobs:
           path: admin
 
       - name: Checkout docs
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Smart-MZCMC/docs
           ref: main
@@ -64,7 +64,7 @@ jobs:
       # 采访端与 admin / docs 一样，产物由后端托管，故在后端流水线内一并构建。
       # 只 checkout 源码，不 checkout 产物：构建结果在下面由 flutter build web 生成。
       - name: Checkout interviewer
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Smart-MZCMC/interviewer
           ref: main
@@ -89,7 +89,7 @@ jobs:
           echo "admin / docs / interviewer 源码就位"
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
@@ -102,10 +102,10 @@ jobs:
       # 省略 version 时它会读取当前目录的 packageManager；
       # 当前目录（backend）没有 package.json，此时回退到 pnpm 最新版。
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
 
@@ -191,7 +191,7 @@ jobs:
           ls -lh backend-linux-amd64.tar.gz
 
       - name: Upload release bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: backend-linux-amd64
           path: backend-linux-amd64.tar.gz
