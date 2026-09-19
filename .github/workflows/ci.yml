@@ -1,0 +1,143 @@
+name: CI
+
+# 后端：Go 1.25 + Goravel。
+#
+# 关键点：后端不托管前端源码，而是托管两个静态站点产物
+# （public/admin 与 public/docs）。这两个站点在独立的仓库里，
+# 所以本工作流需要先跨仓库拉取 admin 与 docs 的源码并构建，
+# 再把产物放进 public/ 才能编译打包。
+#
+# 必需配置：仓库 secret `CROSS_REPO_TOKEN`
+#   一个可读 Smart-MZCMC/admin 与 Smart-MZCMC/docs 的 PAT
+#   （classic: 勾选 repo；fine-grained: 给这两个仓库 Contents: Read）。
+#   默认的 GITHUB_TOKEN 只能访问当前仓库，无法用于跨仓库 checkout。
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+  # 可选：admin / docs 构建完成后主动触发后端重建。
+  #   在 admin / docs 的 workflow 里用 peter-evans/repository-dispatch 发事件即可。
+  repository_dispatch:
+    types: [frontend-updated]
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.25'
+  NODE_VERSION: '22'
+  PNPM_VERSION: '10'
+
+jobs:
+  build:
+    name: Build with static sites
+    runs-on: ubuntu-latest
+    steps:
+      # 1. 后端自身
+      - name: Checkout backend
+        uses: actions/checkout@v4
+
+      # 2. 跨仓库拉取管理端与文档站源码。
+      #    注意 admin / docs 目录此时是空的，后面才填充产物。
+      - name: Checkout admin
+        uses: actions/checkout@v4
+        with:
+          repository: Smart-MZCMC/admin
+          ref: main
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
+          path: admin
+
+      - name: Checkout docs
+        uses: actions/checkout@v4
+        with:
+          repository: Smart-MZCMC/docs
+          ref: main
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
+          path: docs
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # 3. 构建管理端静态站点
+      - name: Build admin
+        working-directory: admin
+        run: |
+          pnpm install
+          pnpm run build
+
+      # 4. 构建文档站
+      - name: Build docs
+        working-directory: docs
+        run: |
+          pnpm install
+          pnpm run docs:build
+
+      # 5. 把两个站点的产物放进后端静态目录
+      - name: Copy static sites into public/
+        run: |
+          set -e
+          rm -rf public/admin public/docs
+          mkdir -p public/admin public/docs
+          cp -r admin/build/. public/admin/
+          cp -r docs/.vitepress/dist/. public/docs/
+
+      # 入口文件必须就位，否则后端会托管一个空白站点。
+      - name: Verify static sites
+        run: |
+          set -e
+          test -f public/admin/index.html
+          test -f public/docs/index.html
+          test -f public/docs/404.html
+          echo "admin files: $(find public/admin -type f | wc -l)"
+          echo "docs  files: $(find public/docs -type f | wc -l)"
+
+      - name: Download Go modules
+        run: go mod download
+
+      # go vet 能抓到编译级别的问题（未使用变量、格式串错误等）。
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        env:
+          CGO_ENABLED: '0'
+        run: go build -trimpath -ldflags "-s -w" -o smart-mzcmc-linux-amd64 .
+
+      # 产物是「二进制 + 静态站点 + resources」，解压即可运行。
+      - name: Package release bundle
+        run: |
+          set -e
+          mkdir -p release
+          cp smart-mzcmc-linux-amd64 release/
+          cp -r public release/public
+          cp -r resources release/resources
+          cp .env.example release/.env.example
+          tar -czf backend-linux-amd64.tar.gz -C release .
+          ls -lh backend-linux-amd64.tar.gz
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-linux-amd64
+          path: backend-linux-amd64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
