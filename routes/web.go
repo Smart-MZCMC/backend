@@ -19,13 +19,10 @@ func Web() {
 		return ctx.Response().File("./public/index.html")
 	})
 
-	// 管理后台页面
-	facades.Route().Get("/admin", func(ctx http.Context) http.Response {
-		return ctx.Response().File("./public/admin/index.html")
-	})
-	facades.Route().Get("/admin/", func(ctx http.Context) http.Response {
-		return ctx.Response().File("./public/admin/index.html")
-	})
+	// 管理后台（/admin，SvelteKit 静态构建，SPA 路由）
+	// 与文档站（/docs，VitePress 静态构建，cleanUrls）的托管，
+	// 统一由 routes.StaticSites() 全局中间件处理，
+	// 在 bootstrap/app.go 的 WithMiddleware 中挂载。
 
 	// 状态检查
 	statusController := controllers.NewStatusController()
