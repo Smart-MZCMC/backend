@@ -7,10 +7,14 @@ name: CI
 # 所以本工作流需要先跨仓库拉取 admin 与 docs 的源码并构建，
 # 再把产物放进 public/ 才能编译打包。
 #
-# 必需配置：仓库 secret `CROSS_REPO_TOKEN`
-#   一个可读 Smart-MZCMC/admin 与 Smart-MZCMC/docs 的 PAT
-#   （classic: 勾选 repo；fine-grained: 给这两个仓库 Contents: Read）。
-#   默认的 GITHUB_TOKEN 只能访问当前仓库，无法用于跨仓库 checkout。
+# 跨仓库拉取 admin 与 docs 的源码。
+#
+# 凭据：优先使用仓库 secret `CROSS_REPO_TOKEN`（可读 admin 与 docs 的 PAT），
+# 没配置时回退到默认的 `github.token`。
+#   本组织下 admin / docs 都是 public 仓库，默认 token 通常也能读取；
+#   若将来把这两个仓库改成 private，或者 checkout 报 404，就必须配 PAT：
+#     fine-grained -> 选中 admin、docs，Contents: Read-only
+#     classic      -> 勾选 repo scope
 on:
   push:
     branches: [main, master]
@@ -45,7 +49,7 @@ jobs:
         with:
           repository: Smart-MZCMC/admin
           ref: main
-          token: ${{ secrets.CROSS_REPO_TOKEN }}
+          token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
           path: admin
 
       - name: Checkout docs
@@ -53,9 +57,21 @@ jobs:
         with:
           repository: Smart-MZCMC/docs
           ref: main
-          token: ${{ secrets.CROSS_REPO_TOKEN }}
+          token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
           path: docs
           fetch-depth: 0
+
+      # 跨仓库 checkout 失败时给出可操作提示，避免只看到一句 404。
+      - name: Verify cross-repo checkouts
+        run: |
+          set -e
+          for dir in admin docs; do
+            if [ ! -f "$dir/package.json" ]; then
+              echo "::error::拉取 $dir 失败。请为本仓库配置 CROSS_REPO_TOKEN（可读 Smart-MZCMC/$dir 的 PAT）。"
+              exit 1
+            fi
+          done
+          echo "admin / docs 源码就位"
 
       - name: Setup Go
         uses: actions/setup-go@v5
