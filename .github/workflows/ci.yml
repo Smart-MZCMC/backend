@@ -2,26 +2,26 @@ name: CI
 
 # 后端：Go 1.25 + Goravel。
 #
-# 关键点：后端不托管前端源码，而是托管两个静态站点产物
-# （public/admin 与 public/docs）。这两个站点在独立的仓库里，
-# 所以本工作流需要先跨仓库拉取 admin 与 docs 的源码并构建，
-# 再把产物放进 public/ 才能编译打包。
+# 关键点：后端不托管前端源码，而是托管三个静态站点产物
+# （public/admin、public/docs 与 public/interviewer）。这三个站点在独立的
+# 仓库里，所以本工作流需要先跨仓库拉取 admin、docs 与 interviewer 的源码
+# 并构建，再把产物放进 public/ 才能编译打包。
 #
-# 跨仓库拉取 admin 与 docs 的源码。
+# 跨仓库拉取 admin、docs 与 interviewer 的源码。
 #
-# 凭据：优先使用仓库 secret `CROSS_REPO_TOKEN`（可读 admin 与 docs 的 PAT），
+# 凭据：优先使用仓库 secret `CROSS_REPO_TOKEN`（可读这三个仓库的 PAT），
 # 没配置时回退到默认的 `github.token`。
-#   本组织下 admin / docs 都是 public 仓库，默认 token 通常也能读取；
-#   若将来把这两个仓库改成 private，或者 checkout 报 404，就必须配 PAT：
-#     fine-grained -> 选中 admin、docs，Contents: Read-only
+#   本组织下 admin / docs / interviewer 都是 public 仓库，默认 token 通常也能读取；
+#   若将来把这三个仓库改成 private，或者 checkout 报 404，就必须配 PAT：
+#     fine-grained -> 选中 admin、docs、interviewer，Contents: Read-only
 #     classic      -> 勾选 repo scope
 on:
   push:
     branches: [main, master]
   pull_request:
   workflow_dispatch:
-  # 可选：admin / docs 构建完成后主动触发后端重建。
-  #   在 admin / docs 的 workflow 里用 peter-evans/repository-dispatch 发事件即可。
+  # 可选：admin / docs / interviewer 构建完成后主动触发后端重建。
+  #   在各自的 workflow 里用 peter-evans/repository-dispatch 发事件即可。
   repository_dispatch:
     types: [frontend-updated]
 
@@ -42,7 +42,7 @@ jobs:
       - name: Checkout backend
         uses: actions/checkout@v4
 
-      # 2. 跨仓库拉取管理端与文档站源码。
+      # 2. 跨仓库拉取管理端、文档站与采访端源码。
       #    注意 admin / docs 目录此时是空的，后面才填充产物。
       - name: Checkout admin
         uses: actions/checkout@v4
@@ -61,6 +61,16 @@ jobs:
           path: docs
           fetch-depth: 0
 
+      # 采访端与 admin / docs 一样，产物由后端托管，故在后端流水线内一并构建。
+      # 只 checkout 源码，不 checkout 产物：构建结果在下面由 flutter build web 生成。
+      - name: Checkout interviewer
+        uses: actions/checkout@v4
+        with:
+          repository: Smart-MZCMC/interviewer
+          ref: main
+          token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
+          path: interviewer
+
       # 跨仓库 checkout 失败时给出可操作提示，避免只看到一句 404。
       - name: Verify cross-repo checkouts
         run: |
@@ -71,7 +81,12 @@ jobs:
               exit 1
             fi
           done
-          echo "admin / docs 源码就位"
+          # 采访端是 Flutter 工程，用 pubspec.yaml 判断源码是否就位。
+          if [ ! -f "interviewer/pubspec.yaml" ]; then
+            echo "::error::拉取 interviewer 失败。请为本仓库配置 CROSS_REPO_TOKEN（可读 Smart-MZCMC/interviewer 的 PAT）。"
+            exit 1
+          fi
+          echo "admin / docs / interviewer 源码就位"
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -80,10 +95,14 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
+      # 不写 version：本工作流同时构建 admin 与 docs，
+      # 而 docs/package.json 声明了 packageManager: pnpm@12.5.1。
+      # 若这里再指定 version，pnpm/action-setup 会报
+      # "Multiple versions of pnpm specified"。
+      # 省略 version 时它会读取当前目录的 packageManager；
+      # 当前目录（backend）没有 package.json，此时回退到 pnpm 最新版。
       - name: Install pnpm
         uses: pnpm/action-setup@v4
-        with:
-          version: ${{ env.PNPM_VERSION }}
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -104,14 +123,30 @@ jobs:
           pnpm install
           pnpm run docs:build
 
-      # 5. 把两个站点的产物放进后端静态目录
+      # 5. 构建采访端 Flutter Web
+      #    channel 用 stable：interviewer/pubspec.lock 要求 flutter >= 3.44.0。
+      #    与 admin / docs 构建互不依赖，放在同一 job 内串行执行。
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Build interviewer web
+        working-directory: interviewer
+        run: |
+          flutter --version
+          flutter pub get
+          flutter build web --release
+      # 6. 把三个站点的产物放进后端静态目录
       - name: Copy static sites into public/
         run: |
           set -e
-          rm -rf public/admin public/docs
-          mkdir -p public/admin public/docs
+          rm -rf public/admin public/docs public/interviewer
+          mkdir -p public/admin public/docs public/interviewer
           cp -r admin/build/. public/admin/
           cp -r docs/.vitepress/dist/. public/docs/
+          cp -r interviewer/build/web/. public/interviewer/
 
       # 入口文件必须就位，否则后端会托管一个空白站点。
       - name: Verify static sites
@@ -120,8 +155,13 @@ jobs:
           test -f public/admin/index.html
           test -f public/docs/index.html
           test -f public/docs/404.html
-          echo "admin files: $(find public/admin -type f | wc -l)"
-          echo "docs  files: $(find public/docs -type f | wc -l)"
+          # 采访端入口 + Flutter 运行时入口产物。
+          test -f public/interviewer/index.html
+          test -f public/interviewer/main.dart.js
+          test -f public/interviewer/flutter_bootstrap.js
+          echo "admin       files: $(find public/admin -type f | wc -l)"
+          echo "docs        files: $(find public/docs -type f | wc -l)"
+          echo "interviewer files: $(find public/interviewer -type f | wc -l)"
 
       - name: Download Go modules
         run: go mod download
