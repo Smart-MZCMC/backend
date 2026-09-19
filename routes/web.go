@@ -14,6 +14,11 @@ func Web() {
 	// 静态资源
 	facades.Route().Static("public", "./public")
 
+	// 根路由 - 系统首页
+	facades.Route().Get("/", func(ctx http.Context) http.Response {
+		return ctx.Response().File("./public/index.html")
+	})
+
 	// 管理后台页面
 	facades.Route().Get("/admin", func(ctx http.Context) http.Response {
 		return ctx.Response().File("./public/admin/index.html")

@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>校园直播导播协调系统</title>
+<style>
+:root {
+  --bg-primary: #0a0a1a;
+  --bg-secondary: #12122a;
+  --bg-card: #1a1a3e;
+  --bg-hover: #252550;
+  --accent: #4ecca3;
+  --accent-hover: #3dbb92;
+  --accent-dim: rgba(78,204,163,.1);
+  --text-primary: #f0f0f0;
+  --text-secondary: #a0a0b0;
+  --text-muted: #606080;
+  --border: #2a2a4a;
+  --radius: 10px;
+  --radius-sm: 6px;
+  --shadow: 0 4px 24px rgba(0,0,0,.4);
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family: -apple-system, 'Segoe UI', 'Helvetica Neue', sans-serif; background:var(--bg-primary); color:var(--text-primary); min-height:100vh; display:flex; flex-direction:column; }
+a { color:var(--accent); text-decoration:none; transition:color .2s; }
+a:hover { color:var(--accent-hover); }
+
+.hero { text-align:center; padding:80px 20px 48px; }
+.hero h1 { font-size:28px; font-weight:600; color:var(--accent); margin-bottom:12px; }
+.hero p { font-size:14px; color:var(--text-muted); }
+.hero .status-badge { display:inline-flex; align-items:center; gap:6px; margin-top:16px; padding:6px 14px; border-radius:20px; background:var(--bg-card); border:1px solid var(--border); font-size:12px; color:var(--text-secondary); }
+.hero .status-dot { width:8px; height:8px; border-radius:50%; }
+.status-dot.green { background:var(--accent); box-shadow:0 0 6px var(--accent); }
+.status-dot.red { background:#e94560; box-shadow:0 0 6px #e94560; }
+.status-dot.gray { background:var(--text-muted); }
+
+.nav-cards { display:flex; justify-content:center; gap:16px; padding:0 20px; flex-wrap:wrap; max-width:800px; margin:0 auto; }
+.nav-card { background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius); padding:28px 24px; width:220px; text-align:center; transition:all .2s; cursor:pointer; }
+.nav-card:hover { border-color:var(--accent); transform:translateY(-2px); box-shadow:0 8px 24px rgba(0,0,0,.3); }
+.nav-card .icon { font-size:28px; margin-bottom:12px; }
+.nav-card h3 { font-size:15px; font-weight:500; margin-bottom:6px; }
+.nav-card p { font-size:12px; color:var(--text-muted); }
+
+.footer { margin-top:auto; padding:32px 20px; text-align:center; color:var(--text-muted); font-size:12px; }
+.footer a { color:var(--text-secondary); }
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <h1>校园直播导播协调系统</h1>
+  <p>实时通讯 · 多端协同 · 直播保障</p>
+  <div class="status-badge">
+    <span id="statusDot" class="status-dot gray"></span>
+    <span id="statusText">检测中...</span>
+  </div>
+</div>
+
+<div class="nav-cards">
+  <a class="nav-card" href="/admin">
+    <div class="icon">&#9881;</div>
+    <h3>管理后台</h3>
+    <p>用户管理、项目配置、权限分配</p>
+  </a>
+  <a class="nav-card" id="interviewerLink" href="javascript:void(0)">
+    <div class="icon">&#9998;</div>
+    <h3>采访端</h3>
+    <p>现场记者状态切换与心跳保活</p>
+  </a>
+  <a class="nav-card" href="/api/status" target="_blank">
+    <div class="icon">&#9889;</div>
+    <h3>API 状态</h3>
+    <p>查看服务运行状态与在线连接数</p>
+  </a>
+</div>
+
+<div class="footer">
+  <p>Go (Goravel) + SQLite + WebSocket</p>
+</div>
+
+<script>
+const API = window.location.origin;
+
+// 检测服务状态
+async function checkStatus() {
+  try {
+    const res = await fetch(API + '/api/status');
+    const data = await res.json();
+    document.getElementById('statusDot').className = 'status-dot green';
+    document.getElementById('statusText').textContent = '服务在线 · ' + data.online_count + ' 连接';
+  } catch {
+    document.getElementById('statusDot').className = 'status-dot red';
+    document.getElementById('statusText').textContent = '服务离线';
+  }
+}
+
+// 采访端地址（端口 3002）
+const wsPort = parseInt(location.port || '80') + 2 || 3002;
+document.getElementById('interviewerLink').href = location.protocol + '//' + location.hostname + ':' + wsPort + '/interviewer/';
+
+checkStatus();
+setInterval(checkStatus, 10000);
+</script>
+</body>
+</html>
