@@ -1,0 +1,1 @@
+import{J as e,K as t,N as n,q as r}from"./B4PIF1NE.js";function i(){let i=e(t([])),a=1;function o(e,t=`info`){let r=a++;return n(i).push({id:r,message:e,type:t}),r}function s(e){r(i,n(i).filter(t=>t.id!==e),!0)}return{get items(){return n(i)},push:o,dismiss:s,success:e=>o(e,`success`),error:e=>o(e,`error`),warning:e=>o(e,`warning`),info:e=>o(e,`info`)}}var a=i();export{a as t};

@@ -1,0 +1,5 @@
+# 文档站由 `cd docs && pnpm run build:deploy` 生成，产物不入库。
+docs/
+
+# 采访端 Flutter web 产物由 interviewer 目录构建后同步过来，
+# 现有 public/interviewer 为已入库的历史产物，故此处不再忽略。
