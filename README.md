@@ -152,4 +152,21 @@ go build -o smart-mzcmc .   # 编译
 
 `Dockerfile` 提供多阶段构建（`golang:alpine` 编译 → `alpine` 运行）。注意它只 `COPY` 仓库内的 `public/`，所以构建镜像前需要先把 admin 与 docs 的产物放进 `public/`。
 
-CI 见仓库根目录的 `.github/workflows/backend.yml`：先构建 admin 与 docs，下载产物放入 `public/` 后再 `go vet` / `go test` / `go build`，最后打包成 `backend-linux-amd64.tar.gz`。
+### CI
+
+`.github/workflows/ci.yml` 在每次推送时执行：跨仓库拉取 `Smart-MZCMC/admin` 与 `Smart-MZCMC/docs` 的源码 → 构建两个静态站点 → 复制到 `public/admin`、`public/docs` → `go vet` / `go test` / `go build` → 打包成 `backend-linux-amd64.tar.gz`。
+
+**前置配置：** 需要在本仓库添加一个 secret：
+
+| Secret | 说明 |
+| :--- | :--- |
+| `CROSS_REPO_TOKEN` | 能读取 `Smart-MZCMC/admin` 与 `Smart-MZCMC/docs` 的 PAT |
+
+默认的 `GITHUB_TOKEN` 只能访问当前仓库，无法用于跨仓库 checkout，所以必须配 PAT。
+
+- **Fine-grained token**：Repository access 选中 `admin`、`docs` 两个仓库，权限给 `Contents: Read-only`
+- **Classic token**：勾选 `repo` scope
+
+没配这个 secret 时，工作流会在 checkout `admin` 那一步失败。
+
+如果希望 admin / docs 推送后主动触发后端重建，工作流里已经预留了 `repository_dispatch` 的 `frontend-updated` 事件类型；在 admin / docs 的 workflow 里加一个发事件的步骤即可。
