@@ -4,7 +4,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/goravel/framework/contracts/http"
@@ -99,11 +98,7 @@ func contentTypeFor(name string) string {
 // 不用 ctx.Response().File()：gin 的 File() 依赖 http.Dir + http.ServeFile，
 // 在 Windows 上遇到 "D:\..." 形式的绝对路径会被 http.Dir 的路径校验拒绝，
 // 表现为 200 + text/plain + Content-Length: 0 的静默空响应，
-// 导致 .js/.css 等资源全部加载失败。这里自行读字节并显式设置头部。
-//
-// 直接写 ctx.Response().Data(...)：注意这里的返回值不是 AbortableResponse，
-// 只写响应不终止链路。因为 /admin、/docs 前缀下没有业务路由，
-// 后续处理器无事可做，响应会正常渲染出去。
+// 导致 .js/.css 等资源全部加载失败。这里自行读字节并渲染响应。
 func writeFile(ctx http.Context, file string) bool {
 	data, err := os.ReadFile(file)
 	if err != nil {
@@ -112,12 +107,13 @@ func writeFile(ctx http.Context, file string) bool {
 
 	response := ctx.Response()
 	response.Header("Content-Type", contentTypeFor(file))
-	response.Header("Content-Length", strconv.Itoa(len(data)))
 	if strings.Contains(filepath.ToSlash(file), "/_app/") {
 		// SvelteKit 的资源文件名带内容哈希，可以长期缓存。
 		response.Header("Cache-Control", "public, max-age=31536000, immutable")
 	}
-	response.Data(http.StatusOK, contentTypeFor(file), data)
+	if err := response.Data(http.StatusOK, contentTypeFor(file), data).Render(); err != nil {
+		return false
+	}
 	return true
 }
 
