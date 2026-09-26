@@ -1,0 +1,7 @@
+{
+  "_comment": "采访端运行期配置。改这个文件即可换服务器/项目/采访点，不需要重新 flutter build web，改完刷新浏览器即可生效。注意：页面走 HTTPS 时 wsUrl 必须写 wss://，否则浏览器按混合内容拦截且不报错。",
+  "wsUrl": "ws://zhdb.647382.xyz/ws",
+  "projectId": 1,
+  "pointCode": "point_1",
+  "pointName": "采访点 1"
+}

@@ -185,14 +185,28 @@ func verifyInterviewer(dir string) {
 	log("  config.json ✓")
 
 	// 3) 本地 canvaskit
-	canvaskit := filepath.Join(dir, "canvaskit", "canvaskit.js")
+	//    注意路径：引擎在 Chrome/Edge 上实际选的是 chromium 变体
+	//    （实测 5.6MB），顶层那份 6.9MB 的从来没被请求过，
+	//    所以 interviewer/trim-web.mjs 会把它删掉。这里必须跟着查
+	//    chromium/ 而不是顶层，否则打包会误报。
+	canvaskit := filepath.Join(dir, "canvaskit", "chromium", "canvaskit.js")
 	if _, err := os.Stat(canvaskit); err != nil {
-		fatal("采访端缺少本地 canvaskit/%s。\n"+
-			"默认构建会从 gstatic.com 拉 CanvasKit，校园内网通常没有外网，\n"+
-			"结果就是白屏。请用 interviewer/build-web.bat 重新构建\n"+
-			"（它带 --no-web-resources-cdn）。", "canvaskit.js")
+		fatal("采访端缺少本地 canvaskit/chromium/canvaskit.js。\n" +
+			"默认构建会从 gstatic.com 拉 CanvasKit，校园内网通常没有外网，\n" +
+			"结果就是白屏。请用 interviewer/build-web.bat 重新构建\n" +
+			"（它带 --no-web-resources-cdn）。")
 	}
-	log("  本地 canvaskit ✓")
+	log("  本地 canvaskit/chromium ✓")
+
+	// 4) 自带中文子集字体：断网时否则会挂在 gstatic.com 上等超时
+	subset := filepath.Join(dir, "assets", "assets", "fonts", "NotoSansSC-Subset.ttf")
+	if _, err := os.Stat(subset); err != nil {
+		fatal("采访端缺少中文字体 assets/assets/fonts/NotoSansSC-Subset.ttf。\n" +
+			"没有它，Flutter Web 会去 fonts.gstatic.com 拉 Noto Sans SC 与 Roboto，\n" +
+			"断网时请求会一直挂到超时——这正是「首屏要等十多秒」的主因。\n" +
+			"请用 interviewer/build-web.bat 重新构建。")
+	}
+	log("  中文字体子集 ✓")
 }
 
 // ---------- 打包 ----------

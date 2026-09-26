@@ -138,10 +138,14 @@ jobs:
         #   会让所有资源解析到域名根目录并 404 —— 构建不报错，线上直接白屏。
       # --no-web-resources-cdn       ：CanvasKit 默认从 gstatic.com 拉，
       #   校园内网通常没有外网，不加会卡在白屏。走本地 canvaskit/ 目录。
+      # 随后 trim-web.mjs 删掉浏览器从不下载的死重（6 个渲染器变体 +
+      #   8MB 源映射），39.8MB -> 8.9MB。删除清单是用 resource timing
+      #   实测的，不是猜的。
         run: |
           flutter --version
           flutter pub get
           flutter build web --release --base-href /interviewer/ --no-web-resources-cdn
+          node trim-web.mjs build/web
       # 6. 把三个站点的产物放进后端静态目录
       - name: Copy static sites into public/
         run: |
@@ -170,8 +174,14 @@ jobs:
           grep -q '<base href="/interviewer/"' public/interviewer/index.html \
             || { echo "::error::采访端 base-href 不是 /interviewer/，资源会 404 导致白屏。构建命令缺少 --base-href /interviewer/。"; exit 1; }
           # 断网部署下 CanvasKit 必须走本地，不能依赖 gstatic.com。
-          test -f public/interviewer/canvaskit/canvaskit.js \
-            || { echo "::error::采访端缺少本地 canvaskit，断网部署会白屏。构建命令缺少 --no-web-resources-cdn。"; exit 1; }
+          # 注意是 chromium 变体：引擎在 Chrome/Edge 上实际选的是它，
+          # 顶层那份 canvaskit/canvaskit.wasm 从未被请求（会被 trim-web.mjs 删掉）。
+          test -f public/interviewer/canvaskit/chromium/canvaskit.js \
+            || { echo "::error::采访端缺少本地 canvaskit/chromium，断网部署会白屏。构建命令缺少 --no-web-resources-cdn，或未执行 trim-web.mjs。"; exit 1; }
+          # 中文与拉丁字体必须自带：否则会去 fonts.gstatic.com 拉，
+          # 断网时请求挂到超时，就是「首屏等十多秒」的来源。
+          test -f public/interviewer/assets/assets/fonts/NotoSansSC-Subset.ttf \
+            || { echo "::error::采访端缺少中文字体子集，会去 gstatic.com 拉字体并挂起。"; exit 1; }
           echo "admin       files: $(find public/admin -type f | wc -l)"
           echo "docs        files: $(find public/docs -type f | wc -l)"
           echo "interviewer files: $(find public/interviewer -type f | wc -l)"

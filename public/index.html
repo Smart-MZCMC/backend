@@ -3,104 +3,702 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>校园直播导播协调系统</title>
+<!-- color-scheme 让原生控件（滚动条、下拉、输入框）跟随系统外观；下面再用媒体查询整体翻色 -->
+<meta name="color-scheme" content="light dark">
+<!-- 浏览器工具栏配色跟着系统走 -->
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f6f8fb">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0d1424">
+<title>绵中融媒体智汇导播系统</title>
 <style>
+/*
+ * 单文件首页，没有构建步骤，因此样式内联在此。
+ * 令牌命名与取值对齐 admin/src/app.css，两边看起来是一个产品。
+ * 明暗自适应完全由 prefers-color-scheme 驱动——没有 JS、没有本地偏好、
+ * 首屏不闪，切系统主题即时生效。
+ */
 :root {
-  --bg-primary: #0a0a1a;
-  --bg-secondary: #12122a;
-  --bg-card: #1a1a3e;
-  --bg-hover: #252550;
-  --accent: #4ecca3;
-  --accent-hover: #3dbb92;
-  --accent-dim: rgba(78,204,163,.1);
-  --text-primary: #f0f0f0;
-  --text-secondary: #a0a0b0;
-  --text-muted: #606080;
-  --border: #2a2a4a;
-  --radius: 10px;
-  --radius-sm: 6px;
-  --shadow: 0 4px 24px rgba(0,0,0,.4);
+  --bg-base: #f6f8fb;
+  --bg-surface: #ffffff;
+  --bg-overlay: #f1f5f9;
+  --bg-hover: #eef2f7;
+  --bg-highlight: #eff6ff;
+  --border: #e2e8f0;
+  --border-strong: #cbd5e1;
+  --fg: #0f172a;
+  --fg-muted: #64748b;
+  --fg-faint: #94a3b8;
+  --primary: #2563eb;
+  --primary-ink: #1d4ed8;
+  --primary-soft: #eff6ff;
+  --success: #16a34a;
+  --success-soft: #ecfdf5;
+  --success-ink: #047857;
+  --warning: #d97706;
+  --warning-soft: #fffbeb;
+  --warning-ink: #b45309;
+  --error: #dc2626;
+  --error-soft: #fef2f2;
+  --error-ink: #b91c1c;
+  --shadow-panel: 0 1px 2px rgb(15 23 42 / 0.04), 0 8px 24px -18px rgb(15 23 42 / 0.2);
+  --shadow-pop: 0 8px 28px -12px rgb(15 23 42 / 0.25);
+  --radius: 0.75rem;
+  --radius-sm: 0.5rem;
 }
-* { margin:0; padding:0; box-sizing:border-box; }
-body { font-family: -apple-system, 'Segoe UI', 'Helvetica Neue', sans-serif; background:var(--bg-primary); color:var(--text-primary); min-height:100vh; display:flex; flex-direction:column; }
-a { color:var(--accent); text-decoration:none; transition:color .2s; }
-a:hover { color:var(--accent-hover); }
 
-.hero { text-align:center; padding:80px 20px 48px; }
-.hero h1 { font-size:28px; font-weight:600; color:var(--accent); margin-bottom:12px; }
-.hero p { font-size:14px; color:var(--text-muted); }
-.hero .status-badge { display:inline-flex; align-items:center; gap:6px; margin-top:16px; padding:6px 14px; border-radius:20px; background:var(--bg-card); border:1px solid var(--border); font-size:12px; color:var(--text-secondary); }
-.hero .status-dot { width:8px; height:8px; border-radius:50%; }
-.status-dot.green { background:var(--accent); box-shadow:0 0 6px var(--accent); }
-.status-dot.red { background:#e94560; box-shadow:0 0 6px #e94560; }
-.status-dot.gray { background:var(--text-muted); }
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-base: #0d1424;
+    --bg-surface: #151e33;
+    --bg-overlay: #1b2439;
+    --bg-hover: #1f2a45;
+    --bg-highlight: #1a2745;
+    --border: #26324c;
+    --border-strong: #38466a;
+    --fg: #e6ecf7;
+    --fg-muted: #98a5bd;
+    --fg-faint: #6c7b95;
+    --primary-ink: #8ab4ff;
+    --primary-soft: #1a2a4a;
+    --success: #34d399;
+    --success-soft: #0e2b22;
+    --success-ink: #4ade80;
+    --warning: #fbbf24;
+    --warning-soft: #2e2410;
+    --warning-ink: #fbbf24;
+    --error: #f87171;
+    --error-soft: #35191c;
+    --error-ink: #fca5a5;
+    --shadow-panel: 0 1px 2px rgb(0 0 0 / 0.35), 0 8px 24px -18px rgb(0 0 0 / 0.7);
+    --shadow-pop: 0 8px 28px -12px rgb(0 0 0 / 0.6);
+  }
+}
 
-.nav-cards { display:flex; justify-content:center; gap:16px; padding:0 20px; flex-wrap:wrap; max-width:800px; margin:0 auto; }
-.nav-card { background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius); padding:28px 24px; width:220px; text-align:center; transition:all .2s; cursor:pointer; }
-.nav-card:hover { border-color:var(--accent); transform:translateY(-2px); box-shadow:0 8px 24px rgba(0,0,0,.3); }
-.nav-card .icon { font-size:28px; margin-bottom:12px; }
-.nav-card h3 { font-size:15px; font-weight:500; margin-bottom:6px; }
-.nav-card p { font-size:12px; color:var(--text-muted); }
+* { margin: 0; padding: 0; box-sizing: border-box; }
 
-.footer { margin-top:auto; padding:32px 20px; text-align:center; color:var(--text-muted); font-size:12px; }
-.footer a { color:var(--text-secondary); }
+body {
+  font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont,
+               'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  background: var(--bg-base);
+  color: var(--fg);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+a { color: inherit; text-decoration: none; }
+button { font: inherit; color: inherit; }
+
+:focus-visible {
+  outline: 3px solid rgb(37 99 235 / 0.22);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+@media (prefers-color-scheme: dark) {
+  :focus-visible { outline-color: rgb(96 165 250 / 0.32); }
+}
+
+::selection { background: rgb(37 99 235 / 0.16); }
+@media (prefers-color-scheme: dark) {
+  ::selection { background: rgb(96 165 250 / 0.24); }
+}
+
+.wrap { width: 100%; max-width: 1000px; margin: 0 auto; padding: 0 20px; }
+
+/* ---------- 顶栏 ---------- */
+.topbar {
+  position: sticky; top: 0; z-index: 20;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg-surface) 88%, transparent);
+  backdrop-filter: blur(10px);
+}
+.topbar .wrap {
+  display: flex; align-items: center; gap: 12px;
+  height: 60px;
+}
+.logo {
+  display: grid; place-items: center;
+  width: 36px; height: 36px; flex: none;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #3b82f6, #4f46e5);
+  color: #fff;
+  box-shadow: 0 2px 8px rgb(37 99 235 / 0.3);
+}
+.brand { min-width: 0; }
+.brand b { display: block; font-size: 13.5px; font-weight: 600; letter-spacing: -0.01em; }
+.brand span { display: block; margin-top: 1px; font-size: 10.5px; color: var(--fg-muted); }
+
+/* 总状态徽章 */
+.pill {
+  display: inline-flex; align-items: center; gap: 7px;
+  margin-left: auto; flex: none;
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-surface);
+  font-size: 12px;
+  color: var(--fg-muted);
+  white-space: nowrap;
+}
+.dot { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--fg-faint); }
+.pill[data-state="ok"] { border-color: color-mix(in srgb, var(--success) 35%, var(--border)); background: var(--success-soft); color: var(--success-ink); }
+.pill[data-state="ok"] .dot { background: var(--success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 18%, transparent); }
+.pill[data-state="warn"] { border-color: color-mix(in srgb, var(--warning) 35%, var(--border)); background: var(--warning-soft); color: var(--warning-ink); }
+.pill[data-state="warn"] .dot { background: var(--warning); }
+.pill[data-state="down"] { border-color: color-mix(in srgb, var(--error) 35%, var(--border)); background: var(--error-soft); color: var(--error-ink); }
+.pill[data-state="down"] .dot { background: var(--error); }
+
+/* ---------- 主区 ---------- */
+main { flex: 1; padding: 48px 0 40px; }
+
+.hero { text-align: center; margin-bottom: 36px; }
+.hero h1 {
+  font-size: clamp(24px, 4.2vw, 32px);
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+}
+.hero p {
+  margin: 12px auto 0;
+  max-width: 560px;
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--fg-muted);
+}
+.chips { display: flex; justify-content: center; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
+.chip {
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-surface);
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+/* ---------- 服务状态 ---------- */
+.section-title {
+  display: flex; align-items: center; gap: 8px;
+  margin: 0 0 12px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+}
+.section-title::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+
+.services { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-bottom: 36px; }
+.service {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-panel);
+}
+.service .ico {
+  display: grid; place-items: center;
+  width: 34px; height: 34px; flex: none;
+  border-radius: var(--radius-sm);
+  background: var(--bg-overlay);
+  color: var(--fg-faint);
+}
+.service .txt { min-width: 0; flex: 1; }
+.service .name { display: flex; align-items: center; gap: 7px; font-size: 13.5px; font-weight: 600; }
+.service .addr { display: block; margin-top: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; line-height: 1.5; color: var(--fg-faint); overflow-wrap: anywhere; }
+.service .meta { display: block; margin-top: 5px; font-size: 11.5px; line-height: 1.5; color: var(--fg-muted); }
+
+.sdot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--fg-faint); }
+.sdot[data-state="ok"] { background: var(--success); }
+.sdot[data-state="down"] { background: var(--error); }
+
+/* ---------- 入口 ---------- */
+/* 210px 下限让 4 张卡在 1000px 容器里正好一行排满，不会出现 3+1 的孤儿行 */
+.nav-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; margin-bottom: 36px; }
+.nav-card {
+  display: block;
+  padding: 22px 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-panel);
+  transition: transform .18s, border-color .18s, background-color .18s, box-shadow .18s;
+}
+.nav-card:hover {
+  transform: translateY(-2px);
+  border-color: color-mix(in srgb, var(--primary) 45%, var(--border));
+  background: var(--primary-soft);
+  box-shadow: var(--shadow-pop);
+}
+.nav-card .ico {
+  display: grid; place-items: center;
+  width: 38px; height: 38px;
+  margin-bottom: 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-overlay);
+  color: var(--primary-ink);
+  transition: background-color .18s, color .18s;
+}
+.nav-card:hover .ico { background: var(--bg-surface); color: var(--primary); }
+.nav-card h3 { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+.nav-card p { margin-top: 5px; font-size: 12.5px; line-height: 1.6; color: var(--fg-muted); }
+.nav-card .go { margin-top: 10px; font-size: 11.5px; color: var(--primary-ink); opacity: 0; transition: opacity .18s; }
+.nav-card:hover .go, .nav-card:focus-visible .go { opacity: 1; }
+
+/* ---------- 接入地址 ---------- */
+.endpoints { border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-surface); box-shadow: var(--shadow-panel); overflow: hidden; }
+.ep {
+  display: flex; align-items: center; gap: 12px;
+  padding: 11px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.ep:last-child { border-bottom: 0; }
+.ep .k { flex: none; width: 96px; font-size: 12.5px; color: var(--fg-muted); }
+.ep .v {
+  flex: 1; min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+.copy {
+  flex: none;
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-overlay);
+  color: var(--fg-muted);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: background-color .15s, color .15s, border-color .15s;
+}
+.copy:hover { background: var(--bg-hover); color: var(--fg); border-color: var(--border-strong); }
+.copy[data-done="1"] { color: var(--success-ink); border-color: color-mix(in srgb, var(--success) 40%, var(--border)); background: var(--success-soft); }
+.ep-note { padding: 11px 16px; border-top: 1px solid var(--border); background: var(--bg-overlay); font-size: 11.5px; line-height: 1.7; color: var(--fg-faint); }
+
+/* ---------- 页脚 ---------- */
+footer { border-top: 1px solid var(--border); padding: 22px 0 30px; }
+footer .wrap { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; font-size: 12px; color: var(--fg-faint); }
+footer .sep { opacity: .5; }
+footer .legal { margin-top: 8px; }
+footer .legal a { color: var(--fg-faint); text-decoration: none; }
+footer .legal a:hover { color: var(--primary-ink); text-decoration: underline; }
+
+@media (max-width: 560px) {
+  .brand span { display: none; }
+  .pill { padding: 5px 10px; }
+  .ep { flex-wrap: wrap; }
+  .ep .k { width: auto; }
+  .ep .v { flex-basis: 100%; order: 3; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+}
 </style>
 </head>
 <body>
 
-<div class="hero">
-  <h1>校园直播导播协调系统</h1>
-  <p>实时通讯 · 多端协同 · 直播保障</p>
-  <div class="status-badge">
-    <span id="statusDot" class="status-dot gray"></span>
-    <span id="statusText">检测中...</span>
+<div class="topbar">
+  <div class="wrap">
+    <span class="logo" aria-hidden="true">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="2" y="4" width="20" height="13" rx="2.5"/><path d="M8 21h8M12 17v4"/><path d="M7 11.5l2.5-3 2 2.5 2-4 3 4.5"/>
+      </svg>
+    </span>
+    <span class="brand">
+      <b>绵中融媒体智汇导播系统</b>
+      <span>校园直播导播协调平台</span>
+    </span>
+    <span class="pill" id="pill" data-state="pending">
+      <span class="dot"></span>
+      <span id="pillText">检测中…</span>
+    </span>
   </div>
 </div>
 
-<div class="nav-cards">
-  <a class="nav-card" href="/admin">
-    <div class="icon">&#9881;</div>
-    <h3>管理后台</h3>
-    <p>用户管理、项目配置、权限分配</p>
-  </a>
-  <a class="nav-card" id="interviewerLink" href="javascript:void(0)">
-    <div class="icon">&#9998;</div>
-    <h3>采访端</h3>
-    <p>现场记者状态切换与心跳保活</p>
-  </a>
-  <a class="nav-card" href="/api/status" target="_blank">
-    <div class="icon">&#9889;</div>
-    <h3>API 状态</h3>
-    <p>查看服务运行状态与在线连接数</p>
-  </a>
-</div>
+<main>
+  <div class="wrap">
 
-<div class="footer">
-  <p>Go (Goravel) + SQLite + WebSocket</p>
-</div>
+    <section class="hero">
+      <h1>导播预判、解说同步、包装联动，<br>一条链路全部留痕</h1>
+      <p>导播端切台时同时下发「当前播送」与「即将切台」，解说端与包装端各取所需；控制权互斥、采访点状态实时广播，全程日志可回溯。</p>
+      <div class="chips">
+        <span class="chip">Go + Goravel</span>
+        <span class="chip">WebSocket</span>
+        <span class="chip">SQLite</span>
+        <span class="chip">JWT 鉴权</span>
+        <span class="chip">可插拔插件</span>
+      </div>
+    </section>
+
+    <h2 class="section-title">服务状态</h2>
+    <div class="services">
+      <div class="service">
+        <span class="ico" aria-hidden="true">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><path d="M6 7h.01M6 17h.01"/>
+          </svg>
+        </span>
+        <span class="txt">
+          <span class="name">HTTP API <span class="sdot" id="d-api" data-state="pending"></span></span>
+          <span class="addr" id="a-api">—</span>
+          <span class="meta" id="m-api">管理后台与文档站的宿主进程</span>
+        </span>
+      </div>
+
+      <div class="service">
+        <span class="ico" aria-hidden="true">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 12a8 8 0 0 1 8-8"/><path d="M4 12a8 8 0 0 0 8 8"/><path d="M8 12a4 4 0 0 1 4-4"/><path d="M8 12a4 4 0 0 0 4 4"/><path d="M12 12h9"/>
+          </svg>
+        </span>
+        <span class="txt">
+          <span class="name">WebSocket Hub <span class="sdot" id="d-ws" data-state="pending"></span></span>
+          <span class="addr" id="a-ws">—</span>
+          <span class="meta" id="m-ws">实时指令与状态推送</span>
+        </span>
+      </div>
+
+      <div class="service">
+        <span class="ico" aria-hidden="true">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14.5 4h-5L8 7H4.5A1.5 1.5 0 0 0 3 8.5v10A1.5 1.5 0 0 0 4.5 20h15a1.5 1.5 0 0 0 1.5-1.5v-11A1.5 1.5 0 0 0 19.5 7H16z"/><circle cx="12" cy="13" r="3.2"/>
+          </svg>
+        </span>
+        <span class="txt">
+          <span class="name">采访端 Web <span class="sdot" id="d-interviewer" data-state="pending"></span></span>
+          <span class="addr" id="a-interviewer">—</span>
+          <span class="meta" id="m-interviewer">现场记者状态切换与保活</span>
+        </span>
+      </div>
+    </div>
+
+    <h2 class="section-title">功能入口</h2>
+    <div class="nav-cards">
+      <a class="nav-card" href="/admin">
+        <span class="ico" aria-hidden="true">
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>
+          </svg>
+        </span>
+        <h3>管理后台</h3>
+        <p>用户管理、项目配置、权限分配、日志审计与插件状态</p>
+        <span class="go">进入 →</span>
+      </a>
+
+      <a class="nav-card" href="/docs">
+        <span class="ico" aria-hidden="true">
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H19v15H6.5A2.5 2.5 0 0 0 4 20.5z"/><path d="M4 5.5v15"/><path d="M8.5 7.5h6.5M8.5 11h4.5"/>
+          </svg>
+        </span>
+        <h3>文档站</h3>
+        <p>操作手册、开发指南、通信协议与插件开发文档</p>
+        <span class="go">阅读 →</span>
+      </a>
+
+      <a class="nav-card" id="card-interviewer" href="#">
+        <span class="ico" aria-hidden="true">
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14.5 4h-5L8 7H4.5A1.5 1.5 0 0 0 3 8.5v10A1.5 1.5 0 0 0 4.5 20h15a1.5 1.5 0 0 0 1.5-1.5v-11A1.5 1.5 0 0 0 19.5 7H16z"/><circle cx="12" cy="13" r="3.2"/>
+          </svg>
+        </span>
+        <h3>采访端</h3>
+        <p>浏览器直接打开，现场记者用大按钮切换就绪状态</p>
+        <span class="go">打开 →</span>
+      </a>
+
+      <a class="nav-card" href="/api/status" target="_blank" rel="noopener">
+        <span class="ico" aria-hidden="true">
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M13 2 4.5 13.5H11l-1 8.5 8.5-11.5H12z"/>
+          </svg>
+        </span>
+        <h3>API 状态</h3>
+        <p>查看原始 JSON：服务状态、在线连接数、版本号</p>
+        <span class="go">查看 →</span>
+      </a>
+    </div>
+
+    <h2 class="section-title">接入地址</h2>
+    <div class="endpoints">
+      <div class="ep">
+        <span class="k">HTTP API</span>
+        <span class="v" id="ep-api">—</span>
+        <button class="copy" type="button" data-copy="ep-api">复制</button>
+      </div>
+      <div class="ep">
+        <span class="k">WebSocket</span>
+        <span class="v" id="ep-ws">—</span>
+        <button class="copy" type="button" data-copy="ep-ws">复制</button>
+      </div>
+      <div class="ep">
+        <span class="k">管理后台</span>
+        <span class="v" id="ep-admin">—</span>
+        <button class="copy" type="button" data-copy="ep-admin">复制</button>
+      </div>
+      <div class="ep">
+        <span class="k">采访端</span>
+        <span class="v" id="ep-interviewer">—</span>
+        <button class="copy" type="button" data-copy="ep-interviewer">复制</button>
+      </div>
+      <div class="ep-note">
+        解说端与包装端只需在 exe 同目录的 <code>config.json</code> 里改 <code>WsUrl</code> 一项，
+        <code>Role</code> 分别写 <code>commentator</code> / <code>packaging</code>，<code>ProjectId</code> 填目标项目。
+        采访端改 <code>public/interviewer/config.json</code> 的 <code>wsUrl</code>，刷新浏览器即可，都不需要重新编译。
+        <br />
+        页面已自动识别是否经过反向代理：能同源访问 <code>/ws/status</code> 就用同源地址，
+        否则退回 <code>:3002</code> 直连。用 <code>?wsport=端口</code> 可强制走直连并指定端口。
+      </div>
+    </div>
+
+  </div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>绵中融媒体智汇导播系统</span>
+    <span class="sep">·</span>
+    <span>Go 1.25 + Goravel + SQLite + WebSocket</span>
+    <span class="sep">·</span>
+    <span id="f-version">—</span>
+  </div>
+  <div class="wrap legal">
+    <span>Copyright © <span id="f-year">2026</span> 烧瑚烙饼 版权所有</span>
+    <span class="sep">·</span>
+    <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener nofollow">蜀ICP备2025120814号-1</a>
+  </div>
+</footer>
 
 <script>
-const API = window.location.origin;
+(function () {
+  'use strict';
 
-// 检测服务状态
-async function checkStatus() {
-  try {
-    const res = await fetch(API + '/api/status');
-    const data = await res.json();
-    document.getElementById('statusDot').className = 'status-dot green';
-    document.getElementById('statusText').textContent = '服务在线 · ' + data.online_count + ' 连接';
-  } catch {
-    document.getElementById('statusDot').className = 'status-dot red';
-    document.getElementById('statusText').textContent = '服务离线';
+  // ---- 地址推导 --------------------------------------------------------
+  // 两种部署形态都要支持，页面自己判断：
+  //
+  //  A. 直接访问（本地开发 / 未配反代）：页面在 3000，WS 在 3002，
+  //     需要跨端口探 http://<host>:3002/ws/status。
+  //  B. 反向代理（生产，走 zhdb.647382.xyz 这类域名）：nginx 把 /ws、
+  //     /interviewer/ 都转到了 3002。此时 3002 只监听 127.0.0.1，
+  //     公网根本连不上——如果还去探 :3002 就会误报「WebSocket 不可达」。
+  //
+  // 所以策略是「同源优先，失败再退回 :3002」：
+  // 探同源 /ws/status，成功就说明是反代形态，地址也用同源；
+  // 失败再试 :3002，覆盖直连形态。
+  // 用户也可以用 ?wsport= 强制指定端口。
+  var params = new URLSearchParams(location.search);
+  var host = location.hostname || '127.0.0.1';
+  var httpPort = location.port || '';
+
+  // 反代形态下的候选：同源。
+  // 直连形态下的候选：<当前端口+2>，默认 3002。
+  var p = parseInt(httpPort, 10);
+  var directPort = params.get('wsport') || (httpPort && !isNaN(p) ? String(p + 2) : '3002');
+  var forceDirect = params.has('wsport');
+
+  var apiBase = location.origin;
+  var wsScheme = location.protocol === 'https:' ? 'wss://' : 'ws://';
+
+  // 实际使用的地址，探测确定后回填。
+  var resolved = { viaProxy: false, base: '', ws: '', interviewer: '' };
+
+  // ---- 填充静态地址 ----------------------------------------------------
+  function set(id, value) {
+    var el = document.getElementById(id);
+    if (el) el.textContent = value;
   }
-}
+  // 初始先按直连形态填，探测确定后会被覆盖。
+  // 这样即使探测全部失败，页面上的地址也不会是空的。
+  function useDirect() {
+    resolved.viaProxy = false;
+    resolved.base = location.protocol + '//' + host + ':' + directPort;
+    resolved.ws = resolved.base.replace(/^http/, 'ws') + '/ws';
+    resolved.interviewer = resolved.base + '/interviewer/';
+    paint();
+  }
 
-// 采访端地址（端口 3002）
-const wsPort = parseInt(location.port || '80') + 2 || 3002;
-document.getElementById('interviewerLink').href = location.protocol + '//' + location.hostname + ':' + wsPort + '/interviewer/';
+  function useProxy() {
+    resolved.viaProxy = true;
+    resolved.base = location.origin;
+    // 用 location.host（含端口）而不是 location.hostname：
+    // 反代跑在标准 80/443 时两者相同，但跑在非标端口上时
+    // 拼出来的 ws:// 地址会丢掉端口，客户端照抄就连不上。
+    resolved.ws = wsScheme + location.host + '/ws';
+    resolved.interviewer = location.origin + '/interviewer/';
+    paint();
+  }
 
-checkStatus();
-setInterval(checkStatus, 10000);
+  function paint() {
+    set('a-api', apiBase);
+    set('a-ws', resolved.ws);
+    set('a-interviewer', resolved.interviewer);
+    set('ep-api', apiBase);
+    set('ep-ws', resolved.ws);
+    set('ep-admin', apiBase + '/admin');
+    set('ep-interviewer', resolved.interviewer);
+    var card = document.getElementById('card-interviewer');
+    if (card) card.href = resolved.interviewer;
+  }
+
+  useDirect();
+  document.getElementById('f-year').textContent = String(new Date().getFullYear());
+
+  // ---- 状态探测 --------------------------------------------------------
+  // HTTP API 与 WebSocket 是两个独立进程：只探 /api/status 的话，
+  // WS 挂了页面仍会显示「服务在线」。所以两个都探，合计判断。
+  var state = { api: false, ws: false, interviewer: false, online: 0, version: '' };
+
+  function setDot(id, ok) {
+    var el = document.getElementById(id);
+    if (el) el.setAttribute('data-state', ok ? 'ok' : 'down');
+  }
+
+  function withTimeout(promise, ms) {
+    return new Promise(function (resolve, reject) {
+      var timer = setTimeout(function () { reject(new Error('timeout')); }, ms);
+      promise.then(
+        function (v) { clearTimeout(timer); resolve(v); },
+        function (e) { clearTimeout(timer); reject(e); }
+      );
+    });
+  }
+
+  function fetchJson(url, timeoutMs) {
+    var opts = { cache: 'no-store' };
+    if (timeoutMs) opts.signal = AbortSignal.timeout(timeoutMs);
+    return fetch(url, opts).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    });
+  }
+
+  function check() {
+    // 1) HTTP API：同源，可读 body 拿在线数与版本
+    fetchJson(apiBase + '/api/status', 5000)
+      .then(function (d) {
+        state.api = true;
+        state.online = Number(d.online_count) || 0;
+        state.version = d.version || '';
+        setDot('d-api', true);
+        set('m-api', '在线连接 ' + state.online + ' 个 · v' + (state.version || '?'));
+        set('f-version', state.version ? 'v' + state.version : '');
+      })
+      .catch(function () {
+        state.api = false;
+        setDot('d-api', false);
+        set('m-api', '无法连接 · 管理后台可能不可用');
+      })
+      .then(function () {
+        // 2) WebSocket Hub：同源优先，失败再退回直连端口。
+        //
+        // /ws/status 带 CORS 头，跨端口也能读 body；采访端是否已部署
+        // 也由它回报——3002 上的静态处理器不带 CORS 头，从 3000 直接
+        // fetch 采访端页面会被浏览器拦掉，探测结果不可信。
+        //
+        // 顺序很关键：反代部署时 3002 只监听 127.0.0.1，先探它必然失败，
+        // 会把一切正常的部署误报成「WebSocket 不可达」。
+        var order = forceDirect
+          ? [{ proxy: false }, { proxy: true }]
+          : [{ proxy: true }, { proxy: false }];
+
+        function attempt(i) {
+          if (i >= order.length) {
+            state.ws = false;
+            state.interviewer = false;
+            return Promise.resolve();
+          }
+          var useProxyNow = order[i].proxy;
+          var url = useProxyNow ? '/ws/status' : resolved.base + '/ws/status';
+          return withTimeout(fetchJson(url), 3000)
+            .then(function (d) {
+              state.ws = true;
+              state.interviewer = !!(d && d.interviewer);
+              if (useProxyNow) useProxy();
+              return null;
+            })
+            .catch(function () {
+              if (i === order.length - 1) {
+                // 全失败，按直连形态展示，至少让用户看得到该填的地址
+                useDirect();
+                return null;
+              }
+              return attempt(i + 1);
+            });
+        }
+        return attempt(0);
+      })
+      .then(function () {
+        setDot('d-ws', state.ws);
+        set('m-ws', state.ws ? '实时指令通道已就绪' : '无法连接 · 各端将持续重连');
+
+        setDot('d-interviewer', state.ws && state.interviewer);
+        set('m-interviewer',
+          !state.ws ? '随 WebSocket 不可达'
+                    : (state.interviewer ? '浏览器可直接打开' : '未部署产物 · 需 flutter build web'));
+      })
+      .then(function () {
+        var pill = document.getElementById('pill');
+        var text = document.getElementById('pillText');
+        if (state.api && state.ws) {
+          pill.setAttribute('data-state', 'ok');
+          text.textContent = '全部在线 · ' + state.online + ' 个连接';
+        } else if (state.api || state.ws) {
+          pill.setAttribute('data-state', 'warn');
+          text.textContent = state.api ? 'WebSocket 不可达' : 'WebSocket Hub 未启动';
+        } else {
+          pill.setAttribute('data-state', 'down');
+          text.textContent = '服务不可用';
+        }
+      });
+  }
+
+  check();
+  setInterval(check, 10000);
+
+  // ---- 复制 ------------------------------------------------------------
+  // navigator.clipboard 只在 https / localhost 下可用，
+  // 局域网 http 访问时会直接不存在，所以留 execCommand 兜底。
+  function legacyCopy(text) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;top:-1000px;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    return ok;
+  }
+
+  document.addEventListener('click', function (event) {
+    var btn = event.target.closest ? event.target.closest('.copy') : null;
+    if (!btn) return;
+
+    var target = document.getElementById(btn.getAttribute('data-copy'));
+    if (!target) return;
+    var text = target.textContent.trim();
+
+    var done = function (ok) {
+      btn.textContent = ok ? '已复制' : '复制失败';
+      btn.setAttribute('data-done', ok ? '1' : '0');
+      setTimeout(function () {
+        btn.textContent = '复制';
+        btn.removeAttribute('data-done');
+      }, 1600);
+    };
+
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(legacyCopy(text)); });
+    } else {
+      done(legacyCopy(text));
+    }
+  });
+})();
 </script>
 </body>
 </html>
