@@ -1,6 +1,7 @@
 package routes
 
 import (
+	"log"
 	"os"
 	"path"
 	"path/filepath"
@@ -8,6 +9,15 @@ import (
 
 	"github.com/goravel/framework/contracts/http"
 )
+
+// workingDir 返回进程运行目录，仅用于错误提示。
+func workingDir() string {
+	wd, err := os.Getwd()
+	if err != nil {
+		return "(未知)"
+	}
+	return wd
+}
 
 // staticSite 描述一份由 Go 进程直接托管的静态站点构建产物。
 type staticSite struct {
@@ -99,6 +109,12 @@ func contentTypeFor(name string) string {
 // 在 Windows 上遇到 "D:\..." 形式的绝对路径会被 http.Dir 的路径校验拒绝，
 // 表现为 200 + text/plain + Content-Length: 0 的静默空响应，
 // 导致 .js/.css 等资源全部加载失败。这里自行读字节并渲染响应。
+// writeFile 读取文件并写入响应，返回是否成功。
+//
+// 不用 ctx.Response().File()：gin 的 File() 依赖 http.Dir + http.ServeFile，
+// 在 Windows 上遇到 "D:\..." 形式的绝对路径会被 http.Dir 的路径校验拒绝，
+// 表现为 200 + text/plain + Content-Length: 0 的静默空响应，
+// 导致 .js/.css 等资源全部加载失败。这里自行读字节并渲染响应。
 func writeFile(ctx http.Context, file string) bool {
 	data, err := os.ReadFile(file)
 	if err != nil {
@@ -106,15 +122,37 @@ func writeFile(ctx http.Context, file string) bool {
 	}
 
 	response := ctx.Response()
-	response.Header("Content-Type", contentTypeFor(file))
-	if strings.Contains(filepath.ToSlash(file), "/_app/") {
-		// SvelteKit 的资源文件名带内容哈希，可以长期缓存。
-		response.Header("Cache-Control", "public, max-age=31536000, immutable")
-	}
-	if err := response.Data(http.StatusOK, contentTypeFor(file), data).Render(); err != nil {
+	contentType := contentTypeFor(file)
+	response.Header("Content-Type", contentType)
+	response.Header("Cache-Control", cacheControlFor(file))
+	if err := response.Data(http.StatusOK, contentType, data).Render(); err != nil {
 		return false
 	}
 	return true
+}
+
+// cacheControlFor 按文件性质决定缓存策略。
+//
+// 没有这条规则时 Gin 只写 Last-Modified、不写 Cache-Control，浏览器会套用
+// 「启发式缓存」（通常是 Last-Modified 距今 10% 的时长），于是在有效期内
+// 根本不回源请求——改完首页刷新却还是旧内容，就是这么来的。
+//
+// 规则：
+//   - HTML 文档（index.html / 404.html / VitePress 页面）必须每次回源校验，
+//     否则更新站点后用户会一直看到旧页面。no-cache 不是「不缓存」，
+//     它允许存储但强制先向服务器确认，命中 304 时不重复传输。
+//   - SvelteKit 的 /_app/ 资源文件名带内容哈希，可以 immutable 长期缓存。
+//   - 其余（图片、字体等）缓存 1 天，给哈希资源兜底。
+func cacheControlFor(file string) string {
+	slash := filepath.ToSlash(file)
+	switch {
+	case strings.Contains(slash, "/_app/"):
+		return "public, max-age=31536000, immutable"
+	case strings.EqualFold(filepath.Ext(file), ".html"), strings.EqualFold(filepath.Ext(file), ".htm"):
+		return "no-cache, must-revalidate"
+	default:
+		return "public, max-age=86400"
+	}
 }
 
 // handle 尝试用该站点处理请求，返回是否已接管。
@@ -140,9 +178,21 @@ func (s staticSite) handle(ctx http.Context) bool {
 		if writeFile(ctx, filepath.Join(s.Root, name)) {
 			return true
 		}
-		if status == http.StatusNotFound {
-			ctx.Response().NoContent(http.StatusNotFound)
-		}
+		// 入口页本身不存在：说明站点产物没部署，或进程运行目录不对
+		// （Root 是相对 CWD 的 "./public/xxx"）。这种情况必须回 404 并说明原因，
+		// 否则会返回「200 + 空 body」——浏览器只显示一个白页，极难排查。
+		log.Printf("[StaticSites] %s 缺少入口页 %s（站点根=%s，运行目录=%s）",
+			s.Mount, name, s.Root, workingDir())
+		const text = "text/plain; charset=utf-8"
+		ctx.Response().Header("Content-Type", text)
+		ctx.Response().Header("Cache-Control", "no-store")
+		// 必须 Render()：只设 Data 不会把响应写出去，
+		// 结果会是 200 + Content-Length: 0 的空响应。
+		ctx.Response().Data(http.StatusNotFound, text, []byte(
+			s.Mount+" 站点产物未就绪。\n"+
+				"缺少文件: "+filepath.ToSlash(filepath.Join(s.Root, name))+"\n"+
+				"请确认 public/"+strings.TrimPrefix(s.Mount, "/")+" 已随发布包上传，"+
+				"并且进程运行目录就是包含 public/ 的那一层。\n")).Render()
 		return true
 	}
 

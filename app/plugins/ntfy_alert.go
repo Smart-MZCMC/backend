@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -15,30 +16,80 @@ type NtfyAlert struct {
 	topic     string
 	client    *http.Client
 	enabled   bool
+	// reason 记录为什么没启用，会原样透出到管理后台。
+	reason string
+}
+
+// NtfyConfig ntfy 插件的原始配置，来自 config/plugins.go。
+type NtfyConfig struct {
+	// Enabled 是显式开关（"true" / "false"）。留空时按配置是否齐全自动判断。
+	Enabled string
+	Server  string
+	Topic   string
 }
 
 type ntfyPayload struct {
-	Title   string `json:"title"`
-	Message string `json:"message"`
-	Tags    string `json:"tags,omitempty"`
-	Priority int   `json:"priority,omitempty"`
+	Title    string `json:"title"`
+	Message  string `json:"message"`
+	Tags     string `json:"tags,omitempty"`
+	Priority int    `json:"priority,omitempty"`
 }
 
-func NewNtfyAlert(serverURL, topic string) *NtfyAlert {
-	if serverURL == "" || topic == "" {
-		log.Printf("[NtfyAlert] 未配置 server/topic，插件禁用")
-		return &NtfyAlert{enabled: false}
-	}
-	return &NtfyAlert{
-		serverURL: serverURL,
-		topic:     topic,
+func NewNtfyAlert(cfg NtfyConfig) *NtfyAlert {
+	n := &NtfyAlert{
+		serverURL: strings.TrimRight(cfg.Server, "/"),
+		topic:     cfgTopic(cfg.Topic),
 		client:    &http.Client{Timeout: 10 * time.Second},
-		enabled:   true,
 	}
+
+	// 显式开关优先，但配置不全时不允许启用——否则告警会静默丢失，
+	// 比直接报「未配置」更难排查。
+	switch strings.ToLower(strings.TrimSpace(cfg.Enabled)) {
+	case "false", "0", "off", "no":
+		n.reason = "已通过 PLUGIN_NTFY_ENABLED=false 关闭"
+	case "true", "1", "on", "yes":
+		if n.serverURL == "" || n.topic == "" {
+			n.reason = "已开启但 NTFY_SERVER / NTFY_TOPIC 未配齐"
+		} else {
+			n.enabled = true
+		}
+	default:
+		switch {
+		case n.serverURL == "" && n.topic == "":
+			n.reason = "未配置 NTFY_SERVER / NTFY_TOPIC"
+		case n.serverURL == "" || n.topic == "":
+			n.reason = "NTFY_SERVER 与 NTFY_TOPIC 只配了一个，配置不完整"
+		default:
+			n.enabled = true
+		}
+	}
+
+	if n.enabled {
+		log.Printf("[NtfyAlert] 已启用: %s/%s", n.serverURL, n.topic)
+	} else {
+		log.Printf("[NtfyAlert] 未启用: %s", n.reason)
+	}
+	return n
 }
+
+func cfgTopic(topic string) string { return strings.TrimSpace(topic) }
 
 func (n *NtfyAlert) Name() string    { return "ntfy-alert" }
 func (n *NtfyAlert) Version() string { return "1.0.0" }
+
+func (n *NtfyAlert) Describe() Descriptor {
+	return Descriptor{
+		Name:        n.Name(),
+		Version:     n.Version(),
+		Description: "把导播掉线、控制权超时、采访点离线等事件推送到 ntfy",
+		Enabled:     n.enabled,
+		Reason:      n.reason,
+		Config: map[string]string{
+			"server": n.serverURL,
+			"topic":  MaskSecret(n.topic),
+		},
+	}
+}
 
 func (n *NtfyAlert) OnEvent(event Event) {
 	if !n.enabled {

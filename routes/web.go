@@ -15,7 +15,12 @@ func Web() {
 	facades.Route().Static("public", "./public")
 
 	// 根路由 - 系统首页
+	//
+	// 这里必须显式写 Cache-Control：Response().File() 走 gin 的静态文件分支，
+	// 只带 Last-Modified 不带缓存指令，浏览器会套用启发式缓存，导致改完首页
+	// 刷新仍显示旧内容（见 staticSite.go 里 cacheControlFor 的说明）。
 	facades.Route().Get("/", func(ctx http.Context) http.Response {
+		ctx.Response().Header("Cache-Control", "no-cache, must-revalidate")
 		return ctx.Response().File("./public/index.html")
 	})
 
@@ -38,7 +43,10 @@ func Web() {
 		r.Get("/api/auth/profile", authController.Profile)
 
 		adminController := controllers.NewAdminController()
-		r.Prefix("/api/admin").Group(func(ar route.Router) {
+		// 管理接口除 JWT 外还要校验角色：Jwt 中间件只验证令牌有效，
+		// 不关心持有者身份。少了这一层，任何登录用户（包括最低权限的导播）
+		// 都能列出全部用户与项目、增删项目、分配权限。
+		r.Prefix("/api/admin").Middleware(middleware.RequireRole("admin")).Group(func(ar route.Router) {
 			ar.Get("/users", adminController.ListUsers)
 			ar.Delete("/users/:id", adminController.DeleteUser)
 			ar.Put("/users/:id/role", adminController.UpdateUserRole)
@@ -66,9 +74,15 @@ func Web() {
 		// 插件系统 API
 		r.Get("/api/plugins", plugins.ListPluginsHandler)
 		r.Get("/api/projects/:projectId/stats", plugins.ProjectStatsHandler)
-		r.Post("/api/logs/export", plugins.ExportLogsHandler)
-		r.Post("/api/logs/export/csv", plugins.ExportLogsCSVHandler)
-		r.Post("/api/logs/cleanup", plugins.CleanupLogsHandler)
+
+		// 日志导出与清理属于管理操作，仅管理员可用。
+		// 导播端与管理后台都会读 /api/logs 和 /api/plugins，所以那两个保持
+		// 「已登录即可」，只有会改动数据的导出/清理收紧。
+		r.Prefix("/api/logs").Middleware(middleware.RequireRole("admin")).Group(func(lr route.Router) {
+			lr.Post("/export", plugins.ExportLogsHandler)
+			lr.Post("/export/csv", plugins.ExportLogsCSVHandler)
+			lr.Post("/cleanup", plugins.CleanupLogsHandler)
+		})
 	})
 
 	// === 采访端路由（无需JWT） ===

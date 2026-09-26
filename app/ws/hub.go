@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/gorilla/websocket"
 	"github.com/goravel/framework/facades"
+	"github.com/gorilla/websocket"
 
 	"smart-mzcmc/app/models"
 	"smart-mzcmc/app/plugins"
@@ -23,6 +23,50 @@ type WSMessage struct {
 	SenderID  uint            `json:"sender_id,omitempty"`
 	Payload   json.RawMessage `json:"payload"`
 	Timestamp int64           `json:"timestamp"`
+}
+
+// ShotStatePayload 切台状态载荷。
+//
+// 导播端每次切台都上报一份完整状态，而不是分两次发「预告」和「已切」：
+//   - Current 当前正在播送的机位
+//   - Next    本次要切过去的机位（切过去之后即成为新的 Current）
+//
+// 接收端不再需要自己推断「正在播送」，直接读 Current 即可；
+// 这也让后加入项目的解说端/包装端能立刻拿到状态，而不必等下一次切台。
+type ShotStatePayload struct {
+	Current string `json:"current"`
+	Next    string `json:"next"`
+}
+
+// IsHeartbeat 判断消息是否只是保活心跳。
+//
+// 心跳由客户端每 10 秒发一次，属于「不算数」的消息：既不写入 messages 表，
+// 也不广播给同项目的其他端，因此不会污染日志、不会计入项目消息统计。
+func IsHeartbeat(msg WSMessage) bool {
+	if msg.Type != "chat" {
+		return false
+	}
+	var payload map[string]any
+	if json.Unmarshal(msg.Payload, &payload) != nil {
+		return false
+	}
+	return payload["message"] == "heartbeat"
+}
+
+// sendSystemError 回一条只发给当前客户端的 system 消息。
+func sendSystemError(c *Client, text string) {
+	errMsg := WSMessage{
+		Type:      "system",
+		ProjectID: c.ProjectID,
+		Payload:   json.RawMessage(`{"error":` + strconv.Quote(text) + `}`),
+		Timestamp: time.Now().UnixMilli(),
+	}
+	if data, err := json.Marshal(errMsg); err == nil {
+		select {
+		case c.Send <- data:
+		default:
+		}
+	}
 }
 
 type Client struct {
@@ -325,6 +369,37 @@ func (c *Client) readPump() {
 		msg.SenderID = c.UserID
 		msg.Timestamp = time.Now().UnixMilli()
 
+		// --- 入库前先把「不算数」的消息挑掉 ---
+		//
+		// 规则：结构非法、已废弃、内容为空的消息不是业务事件，不写 messages 表。
+		// 而「格式正确但被拒绝」的切台（例如未持控制权）会照常入库，
+		// 因为那是一次真实的越权尝试，属于审计线索。
+
+		// 心跳只是保活信号：必须在这里就丢弃，否则 messages 表会被刷满。
+		if IsHeartbeat(msg) {
+			continue
+		}
+
+		var state ShotStatePayload
+		switch msg.Type {
+		case "shot_state":
+			if err := json.Unmarshal(msg.Payload, &state); err != nil {
+				log.Printf("[WS] shot_state 载荷非法 (project=%d): %v", c.ProjectID, err)
+				sendSystemError(c, "切台指令格式错误")
+				continue
+			}
+			if state.Current == "" && state.Next == "" {
+				log.Printf("[WS] shot_state 内容为空，已忽略 (project=%d)", c.ProjectID)
+				continue
+			}
+		case "next_shot", "confirm_switch":
+			// 旧协议已并入 shot_state。这里显式吞掉，否则会掉进 default 分支
+			// 被无差别广播给项目内所有客户端。
+			log.Printf("[WS] 收到已废弃的 %s (project=%d)，请将客户端升级到 shot_state", msg.Type, c.ProjectID)
+			sendSystemError(c, "协议已升级为 shot_state，请刷新客户端")
+			continue
+		}
+
 		dbMsg := models.Message{
 			ProjectID: msg.ProjectID,
 			SenderID:  msg.SenderID,
@@ -334,33 +409,24 @@ func (c *Client) readPump() {
 		facades.Orm().Query().Create(&dbMsg)
 
 		switch msg.Type {
-		case "next_shot", "confirm_switch":
-			// 只有持有控制权的导播才能发送切台指令
-			if c.Role == "director" && !checkLockHolder(c.ProjectID, c.UserID) {
-				errMsg := WSMessage{
-					Type:      "system",
-					ProjectID: c.ProjectID,
-					Payload:   json.RawMessage(`{"error":"你未持有控制权，无法切台"}`),
-					Timestamp: time.Now().UnixMilli(),
-				}
-				errData, _ := json.Marshal(errMsg)
-				c.Send <- errData
+		case "shot_state":
+			// 切台状态只能由持有控制权的导播上报。
+			// 之前这里写的是 `c.Role == "director" && !checkLockHolder(...)`，
+			// 条件对非导播角色不成立，等于解说端/包装端/采访端都能无锁注入切台指令。
+			if c.Role != "director" {
+				log.Printf("[WS] 非导播角色 %s 试图上报 shot_state (project=%d)，已拒绝", c.Role, c.ProjectID)
+				sendSystemError(c, "只有导播才能上报切台状态")
 				continue
 			}
-			if msg.Type == "next_shot" {
-				c.Hub.SendToProjectRoles(c.ProjectID, []string{"commentator", "packaging"}, msg)
-			} else {
-				// confirm_switch: 发给解说端(正在播送) + 包装端(当前指令)
-				c.Hub.SendToProjectRoles(c.ProjectID, []string{"commentator", "packaging"}, msg)
+			if !checkLockHolder(c.ProjectID, c.UserID) {
+				log.Printf("[WS] 导播 %d 未持控制权却上报 shot_state (project=%d)，已拒绝", c.UserID, c.ProjectID)
+				sendSystemError(c, "你未持有控制权，无法切台")
+				continue
 			}
+			// 解说端与包装端各自维护「当前播送 / 即将切台」，直接吃这份状态。
+			c.Hub.SendToProjectRoles(c.ProjectID, []string{"commentator", "packaging"}, msg)
+
 		case "chat":
-			// 过滤心跳
-			var payload map[string]any
-			if json.Unmarshal(msg.Payload, &payload) == nil {
-				if payload["message"] == "heartbeat" {
-					continue
-				}
-			}
 			c.Hub.SendToProject(c.ProjectID, msg, nil)
 		case "interview_status":
 			log.Printf("[WS] 采访状态变更: project=%d roles=director,packaging", c.ProjectID)

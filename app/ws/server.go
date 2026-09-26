@@ -9,6 +9,12 @@ import (
 	"strings"
 )
 
+// interviewerWebDir 记录本次启动实际托管的采访端目录，空串表示未部署。
+//
+// 供 /ws/status 一并回报：系统首页跑在 3000 端口，无法直接探测 3002 上
+// 的静态文件（跨域且静态处理器不带 CORS 头），只能由这里告知。
+var interviewerWebDir string
+
 func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -59,11 +65,13 @@ func StartServer(addr string, webDirs ...string) {
 	}))
 	mux.HandleFunc("/ws/status", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status":"ok","online_count":` + strconv.Itoa(DefaultHub.GetOnlineCount()) + `}`))
+		w.Write([]byte(`{"status":"ok","online_count":` + strconv.Itoa(DefaultHub.GetOnlineCount()) +
+			`,"interviewer":` + strconv.Quote(interviewerWebDir) + `}`))
 	}))
 
 	// 采访端：用通配模式处理所有 /interviewer/ 开头的请求
 	webDir := resolveWebDir(webDirs...)
+	interviewerWebDir = webDir
 	if webDir != "" {
 		// 注册一个兜底处理器，匹配所有 /interviewer/ 路径
 		mux.HandleFunc("/interviewer/", serveInterviewer(webDir))
@@ -129,7 +137,7 @@ func withinRoot(root, fullPath string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, "../")
 }
 
-// serveInterviewerFile 设置 Content-Type 后返回文件。
+// serveInterviewerFile 设置 Content-Type 与缓存策略后返回文件。
 func serveInterviewerFile(w http.ResponseWriter, r *http.Request, file string) {
 	// 设置正确的 Content-Type
 	switch filepath.Ext(file) {
@@ -148,6 +156,12 @@ func serveInterviewerFile(w http.ResponseWriter, r *http.Request, file string) {
 	case ".svg":
 		w.Header().Set("Content-Type", "image/svg+xml")
 	}
+
+	// http.ServeFile 只写 Last-Modified，不写 Cache-Control，浏览器会套用启发式缓存，
+	// 更新采访端产物后用户仍会加载到旧版本。Flutter 的产物名不带内容哈希
+	// （main.dart.js 始终同名），所以只能走「每次回源校验」。
+	// 与 routes/staticSite.go 的 cacheControlFor 是同一个问题。
+	w.Header().Set("Cache-Control", "no-cache, must-revalidate")
 
 	http.ServeFile(w, r, file)
 }

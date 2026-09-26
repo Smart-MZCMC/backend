@@ -1,0 +1,30 @@
+[Unit]
+Description=Smart MZCMC 校园直播导播协调系统
+Documentation=file:///opt/smart-mzcmc/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+
+# 这一行必须指向包含 public/ 的那一层。
+# 首页、/admin、/docs 都按进程工作目录解析（./public/xxx），
+# 跑错目录会 404；采访端则按可执行文件所在目录解析。两者规则不同，勿改。
+WorkingDirectory=/opt/smart-mzcmc
+
+ExecStart=/opt/smart-mzcmc/smart-mzcmc
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=always
+RestartSec=5
+# 启动前先跑一次迁移（幂等，升级新增迁移时同样需要）
+ExecStartPre=/opt/smart-mzcmc/smart-mzcmc migrate
+
+StandardOutput=append:/opt/smart-mzcmc/storage/logs/stdout.log
+StandardError=append:/opt/smart-mzcmc/storage/logs/stderr.log
+
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

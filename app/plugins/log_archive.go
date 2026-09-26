@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/goravel/framework/contracts/http"
@@ -19,17 +20,40 @@ type LogArchive struct {
 	retentionDays int
 	checkInterval time.Duration
 	stopCh        chan struct{}
+	stopOnce      sync.Once
+	enabled       bool
+	reason        string
 }
 
-func NewLogArchive(retentionDays int) *LogArchive {
-	if retentionDays <= 0 {
-		retentionDays = 30
-	}
-	return &LogArchive{
-		retentionDays: retentionDays,
-		checkInterval: 1 * time.Hour,
+// LogArchiveConfig 日志归档插件配置，来自 config/plugins.go。
+type LogArchiveConfig struct {
+	Enabled       bool
+	RetentionDays int
+	// CheckInterval 支持 Go duration 写法（30s / 5m / 1h）。无法解析时回退 1h。
+	CheckInterval string
+}
+
+func NewLogArchive(cfg LogArchiveConfig) *LogArchive {
+	l := &LogArchive{
+		retentionDays: cfg.RetentionDays,
+		checkInterval: time.Hour,
 		stopCh:        make(chan struct{}),
+		enabled:       cfg.Enabled,
 	}
+
+	if l.retentionDays <= 0 {
+		l.retentionDays = 30
+	}
+	if d, err := time.ParseDuration(cfg.CheckInterval); err == nil && d > 0 {
+		l.checkInterval = d
+	} else if cfg.CheckInterval != "" {
+		log.Printf("[LogArchive] 无法解析的检查间隔 %q，回退为 1h", cfg.CheckInterval)
+	}
+
+	if !cfg.Enabled {
+		l.reason = "已通过 PLUGIN_LOG_ARCHIVE_ENABLED=false 关闭"
+	}
+	return l
 }
 
 func (l *LogArchive) Name() string    { return "log-archive" }
@@ -37,7 +61,26 @@ func (l *LogArchive) Version() string { return "1.0.0" }
 
 func (l *LogArchive) OnEvent(event Event) {}
 
+func (l *LogArchive) Describe() Descriptor {
+	return Descriptor{
+		Name:        l.Name(),
+		Version:     l.Version(),
+		Description: "定期删除超过保留天数的消息日志",
+		Enabled:     l.enabled,
+		Reason:      l.reason,
+		Config: map[string]string{
+			"retention_days": fmt.Sprintf("%d 天", l.retentionDays),
+			"check_interval": l.checkInterval.String(),
+		},
+	}
+}
+
+// Start 启动定时清理。插件被停用时不启动，事件也不会被处理。
 func (l *LogArchive) Start() {
+	if !l.enabled {
+		log.Printf("[LogArchive] 已停用: %s", l.reason)
+		return
+	}
 	go l.run()
 }
 
@@ -69,7 +112,8 @@ func (l *LogArchive) cleanup() {
 }
 
 func (l *LogArchive) Stop() {
-	close(l.stopCh)
+	// 用 sync.Once 保证幂等：未 Start 过也能安全 Stop，重复调用不会 panic。
+	l.stopOnce.Do(func() { close(l.stopCh) })
 }
 
 // ExportLogsHandler 导出项目日志为 JSON 文件

@@ -17,5 +17,7 @@ func Migrations() []schema.Migration {
 		&migrations.M20260901000004CreateProjectLocksTable{},
 		&migrations.M20260901000005CreateInterviewStatusTable{},
 		&migrations.M20260901000006CreateMessagesTable{},
+		// 数据清理
+		&migrations.M20260926000001PurgeHeartbeatMessages{},
 	}
 }

@@ -134,10 +134,14 @@ jobs:
 
       - name: Build interviewer web
         working-directory: interviewer
+        # --base-href /interviewer/  ：应用挂在 /interviewer/ 下。默认是 "/"，
+        #   会让所有资源解析到域名根目录并 404 —— 构建不报错，线上直接白屏。
+      # --no-web-resources-cdn       ：CanvasKit 默认从 gstatic.com 拉，
+      #   校园内网通常没有外网，不加会卡在白屏。走本地 canvaskit/ 目录。
         run: |
           flutter --version
           flutter pub get
-          flutter build web --release
+          flutter build web --release --base-href /interviewer/ --no-web-resources-cdn
       # 6. 把三个站点的产物放进后端静态目录
       - name: Copy static sites into public/
         run: |
@@ -159,6 +163,15 @@ jobs:
           test -f public/interviewer/index.html
           test -f public/interviewer/main.dart.js
           test -f public/interviewer/flutter_bootstrap.js
+          # 采访端的运行期配置。缺了它现场就没法改服务器地址。
+          test -f public/interviewer/config.json
+          # base-href 配错是「构建通过、线上白屏」，只能在这里拦。
+          # 见 interviewer/README.md 的说明。
+          grep -q '<base href="/interviewer/"' public/interviewer/index.html \
+            || { echo "::error::采访端 base-href 不是 /interviewer/，资源会 404 导致白屏。构建命令缺少 --base-href /interviewer/。"; exit 1; }
+          # 断网部署下 CanvasKit 必须走本地，不能依赖 gstatic.com。
+          test -f public/interviewer/canvaskit/canvaskit.js \
+            || { echo "::error::采访端缺少本地 canvaskit，断网部署会白屏。构建命令缺少 --no-web-resources-cdn。"; exit 1; }
           echo "admin       files: $(find public/admin -type f | wc -l)"
           echo "docs        files: $(find public/docs -type f | wc -l)"
           echo "interviewer files: $(find public/interviewer -type f | wc -l)"

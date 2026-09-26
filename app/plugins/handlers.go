@@ -12,18 +12,39 @@ import (
 )
 
 // CSVExport CSV 导出插件
-type CSVExport struct{}
-
-func NewCSVExport() *CSVExport {
-	return &CSVExport{}
+type CSVExport struct {
+	enabled bool
 }
 
-func (c *CSVExport) Name() string    { return "csv-export" }
-func (c *CSVExport) Version() string { return "1.0.0" }
-func (c *CSVExport) OnEvent(event Event) {}
-func (c *CSVExport) Stop() {}
+func NewCSVExport() *CSVExport {
+	return &CSVExport{enabled: true}
+}
 
-// ListPluginsHandler 列出所有已注册插件
+// NewCSVExportWith 按配置构造，便于停用后仍能在后台看到「已停用」。
+func NewCSVExportWith(enabled bool) *CSVExport {
+	return &CSVExport{enabled: enabled}
+}
+
+func (c *CSVExport) Name() string        { return "csv-export" }
+func (c *CSVExport) Version() string     { return "1.0.0" }
+func (c *CSVExport) OnEvent(event Event) {}
+func (c *CSVExport) Stop()               {}
+
+func (c *CSVExport) Describe() Descriptor {
+	d := Descriptor{
+		Name:        c.Name(),
+		Version:     c.Version(),
+		Description: "日志导出接口：JSON 全量导出与 CSV 导出",
+		Enabled:     c.enabled,
+		Config:      map[string]string{},
+	}
+	if !c.enabled {
+		d.Reason = "已通过 PLUGIN_CSV_EXPORT_ENABLED=false 关闭"
+	}
+	return d
+}
+
+// ListPluginsHandler 列出所有已注册插件，含生效配置与真实开关状态
 func ListPluginsHandler(ctx http.Context) http.Response {
 	plugins := List()
 	return ctx.Response().Json(200, plugins)
