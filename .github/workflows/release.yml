@@ -271,12 +271,6 @@ jobs:
             cp /tmp/key.properties android/key.properties
           fi
           flutter build apk --release
-          # 有正式签名时确认真的用上了，否则和 debug 包无法区分。
-          if [ "$SIGNED" = "true" ]; then
-            unzip -p build/app/outputs/flutter-apk/app-release.apk META-INF/*.RSA >/dev/null 2>&1 \
-              || unzip -p build/app/outputs/flutter-apk/app-release.apk META-INF/*.DSA >/dev/null 2>&1 \
-              || { echo "::error::APK 里找不到签名块，签名可能没生效"; exit 1; }
-          fi
           mkdir -p "$GITHUB_WORKSPACE/out"
           cp build/app/outputs/flutter-apk/app-release.apk \
              "$GITHUB_WORKSPACE/out/director-${{ steps.ver.outputs.version }}.apk"
@@ -296,6 +290,57 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/out"
           cp build/app/outputs/flutter-apk/app-release.apk \
              "$GITHUB_WORKSPACE/out/interviewer-${{ steps.ver.outputs.version }}.apk"
+
+      # 校验 APK 真的是用正式密钥签的。
+      #
+      # 为什么不能用「解包看 META-INF/*.RSA」：那是 v1（JAR）签名的产物。
+      # 本项目 minSdk=24，AGP 因此只生成 v2 签名——签名写在 APK 末尾的
+      # Signing Block 里，根本不存在 META-INF/*.RSA。1.1.0 那次发版就是这么
+      # 失败的：包签得好好的，断言却找不到它要找的东西。
+      #
+      # 光「验签通过」也不够：debug 包同样有 v2 签名块，不比对证书就分不出
+      # 正式包和 debug 包，发出去才发现就晚了。所以这里拿 apksigner 读出实际
+      # 证书指纹，与 ANDROID_CERT_SHA256 比对。
+      - name: Verify APK signatures
+        if: steps.sign.outputs.signed == 'true'
+        env:
+          EXPECTED: ${{ secrets.ANDROID_CERT_SHA256 }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "$EXPECTED" ]; then
+            echo "::error::未配置 ANDROID_CERT_SHA256，无法确认 APK 用的是正式证书。"
+            exit 1
+          fi
+          # 取版本号最新的 build-tools
+          APKSIGNER="$(ls -d "${ANDROID_HOME}"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$APKSIGNER" ]; then
+            echo "::error::找不到 apksigner（ANDROID_HOME=$ANDROID_HOME）"
+            exit 1
+          fi
+          echo "apksigner: $APKSIGNER"
+          echo "期望证书: $EXPECTED"
+
+          failed=0
+          for apk in out/director-"$VERSION".apk out/interviewer-"$VERSION".apk; do
+            if [ ! -f "$apk" ]; then
+              echo "::error::$apk 不存在"
+              failed=1
+              continue
+            fi
+            actual="$("$APKSIGNER" verify --print-certs "$apk" 2>/dev/null \
+              | sed -n 's/.*certificate SHA-256 digest: \([0-9a-f]*\).*/\1/p' | head -1)"
+            if [ -z "$actual" ]; then
+              echo "::error::$apk 验签失败或读不出证书"
+              failed=1
+            elif [ "$actual" != "$EXPECTED" ]; then
+              echo "::error::$apk 的证书不是正式证书：实际 $actual"
+              failed=1
+            else
+              echo "OK  $apk  证书 $actual"
+            fi
+          done
+          [ "$failed" -eq 0 ] || exit 1
 
       - name: Collect and checksum
         run: |
