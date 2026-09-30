@@ -19,5 +19,7 @@ func Migrations() []schema.Migration {
 		&migrations.M20260901000006CreateMessagesTable{},
 		// 数据清理
 		&migrations.M20260926000001PurgeHeartbeatMessages{},
+		// 引入超级管理员后，为存量部署补一个，否则没人能授予该角色
+		&migrations.M20261001000001EnsureSuperAdmin{},
 	}
 }

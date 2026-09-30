@@ -7,6 +7,7 @@ import (
 
 	"smart-mzcmc/app/http/controllers"
 	"smart-mzcmc/app/http/middleware"
+	"smart-mzcmc/app/models"
 	"smart-mzcmc/app/plugins"
 )
 
@@ -29,9 +30,14 @@ func Web() {
 	// 统一由 routes.StaticSites() 全局中间件处理，
 	// 在 bootstrap/app.go 的 WithMiddleware 中挂载。
 
-	// 状态检查
+	// 状态检查（公开）。管理后台侧边栏显示版本号用，字段保持不变以兼容旧前端。
 	statusController := controllers.NewStatusController()
 	facades.Route().Get("/api/status", statusController.ServerStatus)
+
+	// 健康检查（公开）。给监控 / 反向代理探活用，只回答「能不能用」，
+	// 不泄露任何部署信息。
+	healthController := controllers.NewHealthController()
+	facades.Route().Get("/api/health", healthController.Health)
 
 	// === 认证路由（公开） ===
 	authController := controllers.NewAuthController()
@@ -44,11 +50,21 @@ func Web() {
 	facades.Route().Middleware(middleware.Jwt()).Group(func(r route.Router) {
 		r.Get("/api/auth/profile", authController.Profile)
 
+		// 角色清单对任意登录用户开放。管理前端据此渲染角色标签与下拉选项，
+		// 而不是在前端再写一份映射——之前 AppShell、用户页、权限分配页各有一处
+		// admin ? '管理员' : '导播' 的三元表达式，加超级管理员后全部会漏改，
+		// 把超管显示成「导播」。
+		roleController := controllers.NewRoleController()
+		r.Get("/api/roles", roleController.List)
+
 		adminController := controllers.NewAdminController()
 		// 管理接口除 JWT 外还要校验角色：Jwt 中间件只验证令牌有效，
 		// 不关心持有者身份。少了这一层，任何登录用户（包括最低权限的导播）
 		// 都能列出全部用户与项目、增删项目、分配权限。
-		r.Prefix("/api/admin").Middleware(middleware.RequireRole("admin")).Group(func(ar route.Router) {
+		//
+		// 守卫是「管理员及以上」而非「角色等于管理员」，所以超级管理员自动获得
+		// 这里全部接口的访问权，不需要额外在名字列表里补一遍。
+		r.Prefix("/api/admin").Middleware(middleware.RequireRole(models.RoleAdmin)).Group(func(ar route.Router) {
 			ar.Get("/users", adminController.ListUsers)
 			ar.Delete("/users/:id", adminController.DeleteUser)
 			ar.Put("/users/:id/role", adminController.UpdateUserRole)
@@ -59,6 +75,15 @@ func Web() {
 			ar.Post("/assign", adminController.AssignProject)
 			ar.Post("/revoke", adminController.RevokeProject)
 			ar.Get("/users/:id/projects", adminController.ListUserProjects)
+		})
+
+		// 系统维护：只有超级管理员。系统更新会替换服务自身的可执行文件并重启进程，
+		// 任何一次误操作都会影响全系统所有客户端，所以不与普通管理权限同级。
+		systemController := controllers.NewSystemController()
+		r.Prefix("/api/system").Middleware(middleware.RequireRole(models.RoleSuperAdmin)).Group(func(sr route.Router) {
+			sr.Get("/info", systemController.Info)
+			sr.Get("/update", systemController.UpdateStatus)
+			sr.Post("/update/apply", systemController.ApplyUpdate)
 		})
 
 		lockController := controllers.NewLockController()
@@ -77,12 +102,19 @@ func Web() {
 		r.Get("/api/plugins", plugins.ListPluginsHandler)
 		r.Get("/api/projects/:projectId/stats", plugins.ProjectStatsHandler)
 
-		// 日志导出与清理属于管理操作，仅管理员可用。
-		// 导播端与管理后台都会读 /api/logs 和 /api/plugins，所以那两个保持
-		// 「已登录即可」，只有会改动数据的导出/清理收紧。
-		r.Prefix("/api/logs").Middleware(middleware.RequireRole("admin")).Group(func(lr route.Router) {
+		// 日志读取对所有登录用户开放（导播端与管理后台都要看），
+		// 下面把「只读」和「会改动数据」拆成两个等级：
+		//
+		//   导出 —— 负责人及以上。业务侧要看报表导出，这是导播与后勤用不到的。
+		//   清理 —— 管理员及以上。清理会真的删数据，负责人没有理由做这件事。
+		//
+		// 早期两者都是 RequireRole("admin")，等于把「只能删不能导」绑在一起，
+		// 让不需要删除权限的人也被迫持有删除权限。
+		r.Prefix("/api/logs").Middleware(middleware.RequireRole(models.RoleLeader)).Group(func(lr route.Router) {
 			lr.Post("/export", plugins.ExportLogsHandler)
 			lr.Post("/export/csv", plugins.ExportLogsCSVHandler)
+		})
+		r.Prefix("/api/logs").Middleware(middleware.RequireRole(models.RoleAdmin)).Group(func(lr route.Router) {
 			lr.Post("/cleanup", plugins.CleanupLogsHandler)
 		})
 	})

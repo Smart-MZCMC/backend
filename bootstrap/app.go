@@ -1,8 +1,8 @@
 package bootstrap
 
 import (
-	contractsconfiguration "github.com/goravel/framework/contracts/foundation/configuration"
 	contractsfoundation "github.com/goravel/framework/contracts/foundation"
+	contractsconfiguration "github.com/goravel/framework/contracts/foundation/configuration"
 	"github.com/goravel/framework/foundation"
 
 	"smart-mzcmc/config"

@@ -67,20 +67,25 @@ func Jwt() contractshttp.Middleware {
 	return &JwtMiddleware{}
 }
 
-// RoleMiddleware 校验调用者的角色。
+// RoleMiddleware 校验调用者是否达到最低角色等级。
 //
 // 为什么必须有：Jwt 中间件只验证令牌「是否有效」，不关心持有者是谁。
 // 少了这一层，任何登录用户（包括最低权限的导播）都能调管理接口。
+//
+// 语义是「等级 >= min」，不是「角色等于 min」。加超级管理员时这一点很关键：
+// 早期写法是对允许的角色名做等值比较，于是 RequireRole("admin") 并不放行
+// super_admin，每加一个更高角色都得回到每个调用点把名字补一遍——漏一处就是
+// 一个越权或误拒的入口。改成等级后，高角色自动继承低角色的接口访问权。
 //
 // 注意：本文件所有中断响应都用 `Response().Json(...).Abort()` 链式写法。
 // 分成两行写（先 Json 再 ctx.Request().Abort()）会被 gin 重置成
 // 400 + 空 body，客户端拿不到任何错误信息。
 type RoleMiddleware struct {
-	roles []string
+	min models.Role
 }
 
 func (m *RoleMiddleware) Signature() string {
-	return "role:" + strings.Join(m.roles, ",")
+	return "role>=" + string(m.min)
 }
 
 func (m *RoleMiddleware) Handle(ctx contractshttp.Context) {
@@ -101,19 +106,41 @@ func (m *RoleMiddleware) Handle(ctx contractshttp.Context) {
 		return
 	}
 
-	for _, allowed := range m.roles {
-		if user.Role == allowed {
-			ctx.Request().Next()
-			return
-		}
+	role := models.Role(user.Role)
+	if !role.Valid() {
+		// users.role 是 varchar(20) 且没有 CHECK 约束。出现非法值说明数据
+		// 被绕过本项目的路径改过，不能当成「权限不足」糊弄过去——那会让人
+		// 一直找不到真正的原因。
+		ctx.Response().Json(403, map[string]any{
+			"error": "账号角色异常（" + user.Role + "），请联系超级管理员修复",
+		}).Abort()
+		return
+	}
+
+	// 放进 ctx 供控制器做「不能操作同级或更高」这类判断，省掉重复查库。
+	ctx.WithValue("role", role)
+	ctx.WithValue("user", user)
+
+	if role.AtLeast(m.min) {
+		ctx.Request().Next()
+		return
 	}
 
 	ctx.Response().Json(403, map[string]any{
-		"error": "权限不足：该操作需要 " + strings.Join(m.roles, "/") + " 角色，当前为 " + user.Role,
+		"error": "权限不足：该操作需要 " + m.min.Label() + " 及以上角色，当前为 " + role.Label(),
 	}).Abort()
 }
 
-// RequireRole 返回一个校验调用者角色的中间件。
-func RequireRole(roles ...string) contractshttp.Middleware {
-	return &RoleMiddleware{roles: roles}
+// RequireRole 返回一个校验调用者角色等级的中间件。
+//
+// 传入多个角色时取其中权限最低的一个作为门槛，例如
+// RequireRole(RoleAdmin, RoleLeader) 等价于 RequireRole(RoleLeader)。
+func RequireRole(min ...models.Role) contractshttp.Middleware {
+	floor := models.RoleSuperAdmin
+	for _, r := range min {
+		if r.Level() < floor.Level() {
+			floor = r
+		}
+	}
+	return &RoleMiddleware{min: floor}
 }

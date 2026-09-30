@@ -104,11 +104,10 @@ const minPasswordLength = 6
 //
 // 这是公开路由（没有挂在 JWT 中间件组里），但分两种模式：
 //
-//  1. 引导模式：用户表为空时，第一个注册的人自动成为管理员，且请求里
+//  1. 引导模式：用户表为空时，第一个注册的人自动成为超级管理员，且请求里
 //     携带的 role 会被忽略。这是全新部署拿到第一个管理员的唯一途径，
-//     不需要任何预置账号或额外密钥。
-//  2. 常态：已经有用户之后，注册必须由管理员登录态发起，且 role 只能是
-//     admin / director 之一。管理后台的「新建用户」走的也是这个接口。
+//  2. 常态：已经有用户之后，注册必须由管理员及以上登录态发起，且只能授予
+//     不高于自己的角色。管理后台的「新建用户」走的也是这个接口。
 //
 // 早期版本既不限制引导条件、也不校验 role，导致任何能访问到端口的人
 // 都能直接开一个 admin 账号并调用全部管理接口。
@@ -129,13 +128,22 @@ func (c *AuthController) Register(ctx http.Context) http.Response {
 	bootstrap := userCount == 0
 
 	role := requestedRole
+	var actor models.User
 	if bootstrap {
-		// 引导模式：第一个账号固定为管理员，忽略请求里的 role。
-		role = "admin"
-	} else if verr := c.requireAdmin(ctx); verr != nil {
-		// 鉴权放在参数校验之前：这是个公开路由，先校验参数等于把
-		// 密码策略与用户名规则变成匿名可探测的预言机。
-		return ctx.Response().Json(verr.status, map[string]any{"error": verr.message})
+		// 引导模式：第一个账号固定为超级管理员，忽略请求里的 role。
+		//
+		// 必须是超级管理员而不是管理员：只有超级管理员能授予超管角色
+		// （见 guardGrant）。若引导出来的是管理员，就再没有人能创建超管，
+		// 系统会停在一个「谁也管不了谁」的状态——系统更新、角色调整全都做不了。
+		role = string(models.RoleSuperAdmin)
+	} else {
+		a, aerr := resolveActor(ctx, "系统已有账号，创建用户")
+		if aerr != nil {
+			// 鉴权放在参数校验之前：这是个公开路由，先校验参数等于把
+			// 密码策略与用户名规则变成匿名可探测的预言机。
+			return ctx.Response().Json(aerr.status, map[string]any{"error": aerr.message})
+		}
+		actor = a
 	}
 
 	if username == "" || password == "" {
@@ -153,12 +161,16 @@ func (c *AuthController) Register(ctx http.Context) http.Response {
 	}
 	if !bootstrap {
 		if role == "" {
-			role = "director"
+			role = string(models.RoleDirector)
 		}
-		if role != "admin" && role != "director" {
+		newRole := models.Role(role)
+		if !newRole.Valid() {
 			return ctx.Response().Json(400, map[string]any{
-				"error": "角色只能是 admin 或 director",
+				"error": "角色非法，可选值：" + roleOptionsText(),
 			})
+		}
+		if gerr := guardGrant(actor, newRole); gerr != nil {
+			return ctx.Response().Json(gerr.status, map[string]any{"error": gerr.message})
 		}
 	}
 
@@ -181,7 +193,7 @@ func (c *AuthController) Register(ctx http.Context) http.Response {
 	}
 
 	if bootstrap {
-		log.Printf("[AUTH] 引导模式：已创建首个管理员账号 %s", username)
+		log.Printf("[AUTH] 引导模式：已创建首个超级管理员账号 %s", username)
 	}
 
 	return ctx.Response().Json(201, map[string]any{
@@ -192,53 +204,14 @@ func (c *AuthController) Register(ctx http.Context) http.Response {
 	})
 }
 
-type registerError struct {
-	status  int
-	message string
-}
-
-// requireAdmin 校验调用者是管理员。
-//
-// Register 挂在公开路由上，拿不到 JWT 中间件写入的上下文，
-// 所以这里自己解析一次 Authorization 头。
-func (c *AuthController) requireAdmin(ctx http.Context) *registerError {
-	raw := strings.TrimPrefix(ctx.Request().Header("Authorization", ""), "Bearer ")
-	if raw == "" {
-		return &registerError{401, "系统已有账号，创建用户需要管理员登录"}
+// roleOptionsText 拼出「a / b / c」形式的角色清单，用于报错提示。
+func roleOptionsText() string {
+	roles := models.AllRoles()
+	parts := make([]string, 0, len(roles))
+	for _, r := range roles {
+		parts = append(parts, string(r))
 	}
-
-	secret := facades.Config().GetString("jwt.secret")
-	if secret == "" {
-		return &registerError{500, "JWT密钥未配置"}
-	}
-	token, err := jwt.Parse(raw, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-		}
-		return []byte(secret), nil
-	})
-	if err != nil || !token.Valid {
-		return &registerError{401, "令牌无效或已过期，请重新登录"}
-	}
-
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		return &registerError{401, "令牌解析失败"}
-	}
-	key, _ := claims["key"].(string)
-	userID, _ := strconv.ParseUint(key, 10, 64)
-	if userID == 0 {
-		return &registerError{401, "无效的用户ID"}
-	}
-
-	var user models.User
-	if err := facades.Orm().Query().Where("id = ?", userID).First(&user); err != nil {
-		return &registerError{401, "用户不存在或已被删除"}
-	}
-	if user.Role != "admin" {
-		return &registerError{403, "权限不足：只有管理员可以创建用户"}
-	}
-	return nil
+	return strings.Join(parts, " / ")
 }
 
 // BootstrapStatus 报告系统是否还处于「未初始化」状态。
