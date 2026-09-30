@@ -31,6 +31,10 @@ permissions:
 env:
   GO_VERSION: '1.25'
   NODE_VERSION: '22'
+  # 与 docs/package.json 的 packageManager 字段一致 —— 钉别的版本的话，
+  # pnpm 会在 docs 里为了迁就那个字段再自动切一次版本。
+  # 两个 lockfile 都是 lockfileVersion 9.0，已实测 12.5.1 可原样消费。
+  PNPM_VERSION: '12.5.1'
 
 jobs:
   release:
@@ -132,6 +136,11 @@ jobs:
 
       - name: Install pnpm
         uses: pnpm/action-setup@v6
+        with:
+          # 必须显式给 version：本仓库根目录没有 package.json，
+          # 而 pnpm/action-setup 不会回退到最新版，只认 version 输入或
+          # 根 package.json 的 packageManager。详见 ci.yml 里的说明。
+          version: ${{ env.PNPM_VERSION }}
 
       - name: Install Node.js
         uses: actions/setup-node@v7

@@ -31,7 +31,7 @@ permissions:
 env:
   GO_VERSION: '1.25'
   NODE_VERSION: '22'
-  PNPM_VERSION: '10'
+  PNPM_VERSION: '12.5.1'
 
 jobs:
   build:
@@ -95,14 +95,24 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
-      # 不写 version：本工作流同时构建 admin 与 docs，
-      # 而 docs/package.json 声明了 packageManager: pnpm@12.5.1。
-      # 若这里再指定 version，pnpm/action-setup 会报
-      # "Multiple versions of pnpm specified"。
-      # 省略 version 时它会读取当前目录的 packageManager；
-      # 当前目录（backend）没有 package.json，此时回退到 pnpm 最新版。
+      # 必须显式给 version。
+      #
+      # pnpm/action-setup 不会「回退到最新版」：它只认 version 输入，或
+      # $GITHUB_WORKSPACE/package.json（工作区根目录）里的 packageManager /
+      # devEngines 字段。本仓库根目录没有 package.json，两者皆无就直接报
+      # "No pnpm version is specified"。
+      #
+      # 注意它只看根目录，不会递归扫子目录，所以 docs/package.json 的
+      # packageManager 不会与 version 冲突（也就不会触发 "Multiple versions of
+      # pnpm specified"）。但这不代表可以随便填一个版本：docs/package.json 里
+      # 钉的是 pnpm@12.5.1，pnpm 自身在 manage-package-manager-versions 下会
+      # 为它自动切换版本，CI 里若钉 10 就得多下一次 pnpm。所以这里与它保持
+      # 一致。实测 admin / docs 两个 lockfile（lockfileVersion 9.0）都能被
+      # 12.5.1 用 --frozen-lockfile 原样消费。
       - name: Install pnpm
         uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
 
       - name: Install Node.js
         uses: actions/setup-node@v7
