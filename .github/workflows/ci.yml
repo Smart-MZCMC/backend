@@ -32,6 +32,10 @@ env:
   GO_VERSION: '1.25'
   NODE_VERSION: '22'
   PNPM_VERSION: '12.5.1'
+  # 打包器默认写 ../dist（本地多仓库工作区的约定），但流水线里
+  # $GITHUB_WORKSPACE 就是本仓库根目录，../dist 会落到工作区之外，
+  # upload-artifact 只收集工作区内的路径 —— 表现为「打包成功但附件找不到」。
+  MZCMC_DIST_DIR: 'dist'
 
 jobs:
   build:

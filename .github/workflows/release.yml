@@ -35,6 +35,11 @@ env:
   # pnpm 会在 docs 里为了迁就那个字段再自动切一次版本。
   # 两个 lockfile 都是 lockfileVersion 9.0，已实测 12.5.1 可原样消费。
   PNPM_VERSION: '12.5.1'
+  # 打包器默认写 ../dist（本地多仓库工作区的约定），但流水线里
+  # $GITHUB_WORKSPACE 就是本仓库根目录，../dist 会落到工作区之外，
+  # 而下面的 Collect 步骤与 Release 附件都按工作区内的 dist/ 取文件。
+  # 详见 ci.yml 里的说明。
+  MZCMC_DIST_DIR: 'dist'
 
 jobs:
   release:

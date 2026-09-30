@@ -9,3 +9,4 @@ tmp
 *.exe
 server.log
 .mimocode/
+dist/

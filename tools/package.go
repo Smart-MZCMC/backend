@@ -1,5 +1,5 @@
-// 打包 Linux amd64 发布包。用法: go run tools/package.go
-// 产物: ../dist/backend-linux-amd64.tar.gz
+// 打包 Linux amd64 发布包。用法: go run ./tools
+// 产物: ../dist/backend-linux-amd64.tar.gz（可用 MZCMC_DIST_DIR 覆盖，见 distDir）
 package main
 
 import (
@@ -29,6 +29,21 @@ var execFiles = map[string]bool{
 
 var t0 = time.Now()
 
+// distDir 返回产物输出目录。
+//
+// 默认是仓库上一级的 dist/：本地是多仓库工作区（backend 与 admin、docs
+// 等目录并列），各仓库的产物集中到同一个 dist/ 下方便统一归档。
+//
+// 但流水线里 $GITHUB_WORKSPACE 就是本仓库根目录，../dist 会落到工作区之外，
+// 而 upload-artifact 只收集工作区内的路径——结果就是「打包成功、附件却提示
+// 找不到文件」。所以允许用 MZCMC_DIST_DIR 覆盖，workflow 里指向仓库内的 dist/。
+func distDir() string {
+	if d := os.Getenv("MZCMC_DIST_DIR"); d != "" {
+		return d
+	}
+	return filepath.Join("..", "dist")
+}
+
 func log(format string, args ...any) {
 	fmt.Printf("  [%6.1fs] %s\n", time.Since(t0).Seconds(), fmt.Sprintf(format, args...))
 }
@@ -39,7 +54,7 @@ func main() {
 		log("当前系统 %s，将直接构建", runtime.GOOS)
 	}
 
-	dist := filepath.Join("..", "dist")
+	dist := distDir()
 	stage := filepath.Join(dist, pkgName)
 
 	// ---- 1. 清理并创建暂存目录 ----
