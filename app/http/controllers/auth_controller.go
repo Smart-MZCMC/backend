@@ -241,6 +241,23 @@ func (c *AuthController) requireAdmin(ctx http.Context) *registerError {
 	return nil
 }
 
+// BootstrapStatus 报告系统是否还处于「未初始化」状态。
+//
+// 全新部署时用户表为空，登录无从谈起。管理后台据此把登录表单换成
+// 「创建首个管理员」表单，避免用户对着一个永远登不进去的页面发呆。
+//
+// 这是公开路由，只回答布尔值、不暴露任何账号信息。它也不构成信息泄露：
+// 任何人本来就可以直接尝试调 /api/auth/register 去抢注管理员。
+// 真正的防护是首注之后该接口自动收紧为「仅管理员可调用」。
+func (c *AuthController) BootstrapStatus(ctx http.Context) http.Response {
+	count, err := facades.Orm().Query().Model(&models.User{}).Count()
+	if err != nil {
+		log.Printf("[AUTH] 查询用户数失败: %v", err)
+		return ctx.Response().Json(500, map[string]any{"error": "查询失败"})
+	}
+	return ctx.Response().Json(200, map[string]any{"needs_bootstrap": count == 0})
+}
+
 func (c *AuthController) Profile(ctx http.Context) http.Response {
 	userID := ctx.Value("user_id")
 

@@ -37,6 +37,8 @@ func Web() {
 	authController := controllers.NewAuthController()
 	facades.Route().Post("/api/auth/login", authController.Login)
 	facades.Route().Post("/api/auth/register", authController.Register)
+	// 管理后台登录页据此在「登录」与「创建首个管理员」之间切换。
+	facades.Route().Get("/api/auth/bootstrap", authController.BootstrapStatus)
 
 	// === 需要认证的路由 ===
 	facades.Route().Middleware(middleware.Jwt()).Group(func(r route.Router) {

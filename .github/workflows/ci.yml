@@ -201,22 +201,21 @@ jobs:
           CGO_ENABLED: '0'
         run: go build -trimpath -ldflags "-s -w" -o smart-mzcmc-linux-amd64 .
 
-      # 产物是「二进制 + 静态站点 + resources」，解压即可运行。
+      # 打包统一走 tools/package.go，不在这里另写一份。
+      #
+      # 之前 CI 自己 tar 了一遍，产物和本地 `go run ./tools` 打的不是同一个东西：
+      #   - tar 时没有顶层目录，部署命令得改成 `tar -xzf ... && cd` 之外的处理
+      #   - 漏了 DEPLOY.md / start.sh / smart-mzcmc.service
+      #   - 运行期目录没有 .keep 占位，解压后 database/ 不存在
+      #   - 完全没有产物校验（采访端 base-href、canvaskit、字体子集都查不到）
+      # 复用同一个打包器，本地与 CI 的产物才一致，且校验只维护一份。
       - name: Package release bundle
-        run: |
-          set -e
-          mkdir -p release
-          cp smart-mzcmc-linux-amd64 release/
-          cp -r public release/public
-          cp -r resources release/resources
-          cp .env.example release/.env.example
-          tar -czf backend-linux-amd64.tar.gz -C release .
-          ls -lh backend-linux-amd64.tar.gz
+        run: go run ./tools
 
       - name: Upload release bundle
         uses: actions/upload-artifact@v7
         with:
           name: backend-linux-amd64
-          path: backend-linux-amd64.tar.gz
+          path: dist/backend-linux-amd64.tar.gz
           if-no-files-found: error
           retention-days: 7

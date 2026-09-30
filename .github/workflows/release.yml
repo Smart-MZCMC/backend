@@ -1,0 +1,359 @@
+name: Release
+
+# 打 tag 即发布。
+#
+# 用法（在本仓库执行）：
+#   git tag v1.2.0 && git push origin v1.2.0
+#
+# 客户端仓库（admin / docs / director / interviewer）按同一个 tag 拉取。
+# 某个仓库还没打这个 tag 时自动回退到 main，并在 Release 说明里写清
+# 实际用的是哪个 ref —— 发布说明必须能反映真实来源，不能装作可复现。
+#
+# 产物：
+#   backend-linux-amd64.tar.gz   后端发布包（解压即用，含三个静态站点）
+#   director-<ver>.apk           导播端
+#   interviewer-<ver>.apk        采访端
+#   checksums.txt                上面三个文件的 sha256
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（留空则用当前分支最新提交，仅用于预演）'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.25'
+  NODE_VERSION: '22'
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    permissions:
+      # 建 Release、上传附件必须要写权限。
+      contents: write
+    steps:
+      - name: Resolve version
+        id: ver
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF_NAME}"
+          fi
+          VERSION="${VERSION#v}"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::版本号格式应为 v<major>.<minor>.<patch>，实际为 '$VERSION'"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "构建版本: $VERSION"
+
+      - name: Checkout backend
+        uses: actions/checkout@v7
+
+      # 客户端仓库优先按同名 tag 拉取；tag 不存在时回退 main。
+      # 必须在 checkout 阶段就定下来，后面各构建步骤统一用 outputs.ref。
+      - name: Resolve client refs
+        id: client
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          for repo in admin docs director interviewer; do
+            if gh api "repos/Smart-MZCMC/$repo/git/ref/tags/v$VERSION" >/dev/null 2>&1; then
+              echo "$repo=v$VERSION" >> "$GITHUB_OUTPUT"
+              echo "  $repo -> v$VERSION"
+            else
+              echo "$repo=main" >> "$GITHUB_OUTPUT"
+              echo "  $repo -> main（没有 v$VERSION tag）"
+            fi
+          done
+
+      - name: Checkout admin
+        uses: actions/checkout@v7
+        with:
+          repository: Smart-MZCMC/admin
+          ref: ${{ steps.client.outputs.admin }}
+          token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
+          path: admin
+
+      - name: Checkout docs
+        uses: actions/checkout@v7
+        with:
+          repository: Smart-MZCMC/docs
+          ref: ${{ steps.client.outputs.docs }}
+          token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
+          path: docs
+          fetch-depth: 0
+
+      - name: Checkout director
+        uses: actions/checkout@v7
+        with:
+          repository: Smart-MZCMC/director
+          ref: ${{ steps.client.outputs.director }}
+          token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
+          path: director
+
+      - name: Checkout interviewer
+        uses: actions/checkout@v7
+        with:
+          repository: Smart-MZCMC/interviewer
+          ref: ${{ steps.client.outputs.interviewer }}
+          token: ${{ secrets.CROSS_REPO_TOKEN || github.token }}
+          path: interviewer
+
+      - name: Verify cross-repo checkouts
+        run: |
+          set -e
+          for dir in admin docs; do
+            test -f "$dir/package.json" || { echo "::error::拉取 $dir 失败，请配置 CROSS_REPO_TOKEN"; exit 1; }
+          done
+          for dir in director interviewer; do
+            test -f "$dir/pubspec.yaml" || { echo "::error::拉取 $dir 失败，请配置 CROSS_REPO_TOKEN"; exit 1; }
+          done
+          echo "四个客户端仓库源码就位"
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Build admin
+        working-directory: admin
+        run: |
+          pnpm install
+          pnpm run build
+
+      - name: Build docs
+        working-directory: docs
+        run: |
+          pnpm install
+          pnpm run docs:build
+
+      # 两个必需参数与 trim-web.mjs 的理由见 interviewer/README.md。
+      # 少任何一个，构建都成功而线上是白屏或十几秒白屏。
+      - name: Build interviewer web
+        working-directory: interviewer
+        run: |
+          flutter --version
+          flutter pub get
+          flutter build web --release --base-href /interviewer/ --no-web-resources-cdn
+          node trim-web.mjs build/web
+
+      - name: Copy static sites into public/
+        run: |
+          set -e
+          rm -rf public/admin public/docs public/interviewer
+          mkdir -p public/admin public/docs public/interviewer
+          cp -r admin/build/. public/admin/
+          cp -r docs/.vitepress/dist/. public/docs/
+          cp -r interviewer/build/web/. public/interviewer/
+
+      - name: Verify static sites
+        run: |
+          set -e
+          test -f public/admin/index.html
+          test -f public/docs/index.html
+          test -f public/docs/404.html
+          test -f public/interviewer/index.html
+          test -f public/interviewer/main.dart.js
+          test -f public/interviewer/flutter_bootstrap.js
+          test -f public/interviewer/config.json
+          grep -q '<base href="/interviewer/"' public/interviewer/index.html \
+            || { echo "::error::采访端 base-href 不对，线上会白屏。"; exit 1; }
+          test -f public/interviewer/canvaskit/chromium/canvaskit.js \
+            || { echo "::error::采访端缺本地 canvaskit/chromium，断网会白屏。"; exit 1; }
+          test -f public/interviewer/assets/assets/fonts/NotoSansSC-Subset.ttf \
+            || { echo "::error::采访端缺中文字体子集，首屏会去 gstatic.com 挂起。"; exit 1; }
+          echo "admin       files: $(find public/admin -type f | wc -l)"
+          echo "docs        files: $(find public/docs -type f | wc -l)"
+          echo "interviewer files: $(find public/interviewer -type f | wc -l)"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      # 打包器自带产物校验（ELF 架构、运行期数据、采访端三项），
+      # 与本地 `go run ./tools` 完全同一套逻辑。
+      - name: Package release bundle
+        run: go run ./tools
+
+      # ---------------------------------------------------------------------
+      # APK 签名
+      #
+      # 配了 ANDROID_KEYSTORE_BASE64 就用正式签名，没配则退回 debug 签名。
+      # debug 签名的包不能覆盖安装、无法上架，发布说明里会明确标注。
+      #
+      # 生成 keystore：
+      #   keytool -genkey -v -keystore upload-keystore.jks \
+      #           -keyalg RSA -keysize 2048 -validity 10000 -alias upload
+      #   base64 -w0 upload-keystore.jks   # 存进 ANDROID_KEYSTORE_BASE64
+      # ---------------------------------------------------------------------
+      - name: Prepare signing key
+        id: sign
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$HOME/upload-keystore.jks"
+            # 渲染模板时四个字段都要替换，漏一个会让 Gradle 拿着字面量去读文件。
+            sed -e "s|__STORE_PASSWORD__|$KEYSTORE_PASS|g" \
+                -e "s|__KEY_PASSWORD__|$KEY_PASS|g" \
+                -e "s|__KEY_ALIAS__|$KEY_ALIAS|g" \
+                -e "s|__STORE_FILE__|$HOME/upload-keystore.jks|g" \
+                android/key.properties.tmpl > /tmp/key.properties
+            if grep -q '__' /tmp/key.properties; then
+              echo "::error::key.properties 仍有未替换的占位符，请检查本仓库的 android/key.properties.tmpl"
+              exit 1
+            fi
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "使用正式签名（alias=$KEY_ALIAS）"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::未配置 ANDROID_KEYSTORE_BASE64，APK 将用 debug 签名。仅供内网测试，不能覆盖安装、无法上架。"
+          fi
+
+      - name: Build director APK
+        working-directory: director
+        env:
+          SIGNED: ${{ steps.sign.outputs.signed }}
+        run: |
+          set -euo pipefail
+          flutter pub get
+          if [ "$SIGNED" = "true" ]; then
+            mkdir -p android
+            cp /tmp/key.properties android/key.properties
+          fi
+          flutter build apk --release
+          # 有正式签名时确认真的用上了，否则和 debug 包无法区分。
+          if [ "$SIGNED" = "true" ]; then
+            unzip -p build/app/outputs/flutter-apk/app-release.apk META-INF/*.RSA >/dev/null 2>&1 \
+              || unzip -p build/app/outputs/flutter-apk/app-release.apk META-INF/*.DSA >/dev/null 2>&1 \
+              || { echo "::error::APK 里找不到签名块，签名可能没生效"; exit 1; }
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp build/app/outputs/flutter-apk/app-release.apk \
+             "$GITHUB_WORKSPACE/out/director-${{ steps.ver.outputs.version }}.apk"
+
+      - name: Build interviewer APK
+        working-directory: interviewer
+        env:
+          SIGNED: ${{ steps.sign.outputs.signed }}
+        run: |
+          set -euo pipefail
+          flutter pub get
+          if [ "$SIGNED" = "true" ]; then
+            mkdir -p android
+            cp /tmp/key.properties android/key.properties
+          fi
+          flutter build apk --release
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp build/app/outputs/flutter-apk/app-release.apk \
+             "$GITHUB_WORKSPACE/out/interviewer-${{ steps.ver.outputs.version }}.apk"
+
+      - name: Collect and checksum
+        run: |
+          set -euo pipefail
+          cp dist/backend-linux-amd64.tar.gz out/
+          cd out
+          ls -lh
+          sha256sum *.tar.gz *.apk > checksums.txt
+          cat checksums.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.version }}
+          name: 绵中融媒体智汇导播系统 v${{ steps.ver.outputs.version }}
+          draft: true
+          generate_release_notes: true
+          body: |
+            ## 部署
+
+            下载 `backend-linux-amd64.tar.gz`：
+
+            ```sh
+            tar -xzf backend-linux-amd64.tar.gz
+            cd backend-linux-amd64
+            cp .env.example .env      # 必填 JWT_SECRET 与 APP_KEY
+            vi .env
+            ./smart-mzcmc migrate      # 建表，幂等
+            chmod +x start.sh && ./start.sh
+            ```
+
+            完整步骤见包内 `DEPLOY.md`；反向代理配置见 `docs/operation-manual.md`。
+
+            ### 创建管理员
+
+            **必须在对外开放端口前完成。** 此时 `POST /api/auth/register` 是公开的，
+            任何能访问该端口的人都能抢先注册管理员：
+
+            ```sh
+            curl -X POST http://<服务器IP>:3000/api/auth/register \
+              -H "Content-Type: application/json" \
+              -d '{"username":"admin","password":"admin123456","display_name":"系统管理员"}'
+            ```
+
+            ## 本次构建的来源
+
+            | 组件 | ref |
+            | :--- | :--- |
+            | 后端 | `${{ github.ref_name }}` |
+            | admin | `${{ steps.client.outputs.admin }}` |
+            | docs | `${{ steps.client.outputs.docs }}` |
+            | director | `${{ steps.client.outputs.director }}` |
+            | interviewer | `${{ steps.client.outputs.interviewer }}` |
+
+            客户端仓库若有同名 tag 则按 tag 构建，否则回退 main（见上表）。
+
+            ## 客户端地址配置
+
+            配好反向代理后，各端填同一个域名即可，无需带端口：
+
+            | 端 | 文件 | 是否需重新编译 |
+            | :--- | :--- | :--- |
+            | 管理后台 | 无需配置（默认同源） | 否 |
+            | 解说端 / 包装端 | exe 同目录 `config.json` | 否 |
+            | 采访端 | `public/interviewer/config.json` | 否 |
+            | 导播端 | `lib/config.dart` | 是（但 APK 已内置本次配置） |
+
+            > 启用 HTTPS 后，所有 `ws://` 必须改成 `wss://`，
+            > 否则浏览器按混合内容拦截且不报错。
+
+          files: |
+            out/backend-linux-amd64.tar.gz
+            out/director-${{ steps.ver.outputs.version }}.apk
+            out/interviewer-${{ steps.ver.outputs.version }}.apk
+            out/checksums.txt

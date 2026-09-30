@@ -2,6 +2,19 @@
 
 本目录是一个可直接运行的发布包。解压后先改 `.env`，再执行迁移，然后启动。
 
+> **这些包从哪来？** GitHub Releases。给本仓库打 tag 即自动构建发布：
+>
+> ```sh
+> git tag v1.2.0
+> git push origin v1.2.0
+> ```
+>
+> 工作流会构建后端发布包与两个客户端 APK，产出草稿 Release（**默认不直接发布**，
+> 需要人工确认后在 Releases 页面点 Publish）。详见本文末「发布流程」。
+>
+> 离线构建：`cd backend && go run ./tools` → `dist/backend-linux-amd64.tar.gz`。
+> 两者用的是同一个打包器，产物一致。
+
 ## 目录结构
 
 ```
@@ -318,3 +331,76 @@ sudo systemctl start smart-mzcmc
 
 > 换服务器地址**不需要**重新部署后端——解说端、包装端、采访端的地址都在各自
 > 的配置文件里，运行期改。只有导播端要重新 `flutter build`。
+
+---
+
+## 发布流程
+
+打 tag 即触发 `.github/workflows/release.yml`：
+
+```sh
+git tag v1.2.0
+git push origin v1.2.0
+```
+
+产物：
+
+| 文件 | 说明 |
+| --- | --- |
+| `backend-linux-amd64.tar.gz` | 本文档所在的发布包 |
+| `director-<版本>.apk` | 导播端 |
+| `interviewer-<版本>.apk` | 采访端 |
+| `checksums.txt` | 上述三个文件的 sha256 |
+
+### 客户端仓库的 ref 怎么定
+
+工作流优先按**同名 tag** 拉取 admin / docs / director / interviewer；
+某个仓库没打这个 tag 时回退 `main`，并把实际用的 ref 写进 Release 说明。
+发布说明必须反映真实来源，不能装作可复现。
+
+想让发布完全可复现，就在五个仓库打同名 tag：
+
+```sh
+for r in admin docs director interviewer; do
+  git -C ../$r tag v1.2.0 && git -C ../$r push origin v1.2.0
+done
+```
+
+### Release 是草稿
+
+工作流用 `draft: true`，**不会自动发布**。请到 Releases 页面检查后手动点
+Publish。理由是 APK 和域名相关配置出错时后果比较直接，值得人工过一眼。
+
+### APK 签名
+
+配了这四个仓库 secret 就用正式签名：
+
+| Secret | 说明 |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | `base64 -w0 upload-keystore.jks` 的输出 |
+| `ANDROID_KEYSTORE_PASSWORD` | keystore 密码 |
+| `ANDROID_KEY_ALIAS` | 密钥别名 |
+| `ANDROID_KEY_PASSWORD` | 密钥密码 |
+
+没配则退回 **debug 签名**，工作流会打 `::warning::` 提示。这种包无法覆盖安装、
+无法上架，只适合内网测试。
+
+生成 keystore：
+
+```sh
+keytool -genkey -v -keystore upload-keystore.jks \
+        -keyalg RSA -keysize 2048 -validity 10000 -alias upload
+base64 -w0 upload-keystore.jks
+```
+
+正式签名时工作流还会解包 APK 检查签名块是否真的存在，签名没生效会直接失败
+——否则正式包和 debug 包长得一模一样，发出去才发现。
+
+### `applicationId` 还是模板默认值
+
+两个 APK 的 `applicationId` 目前是 Flutter 模板默认的
+`com.example.director` / `com.example.interviewer`。**正式分发前应改成自己的
+反向域名**（例如 `cn.edu.mzjc.director`），改在各自的
+`android/app/build.gradle.kts` 里 `applicationId` 与 `namespace` 两处。
+
+注意：**一旦改过并分发过就不能再改**，否则系统会当成另一个应用，无法覆盖安装。

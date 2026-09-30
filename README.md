@@ -135,6 +135,7 @@ CI 会把跨仓库的 admin / docs / interviewer 源码一并拉下来构建。
 | :--- | :--- | :--- |
 | `POST` | `/api/auth/login` | 登录，返回 JWT 与用户信息 |
 | `POST` | `/api/auth/register` | 创建用户，**双模式**，见下方说明 |
+| `GET` | `/api/auth/bootstrap` | 是否还没有任何账号（供后台登录页切换表单） |
 | `GET` | `/api/status` | 服务状态与在线连接数 |
 | `GET` | `/api/interview/:projectId` | 查询项目下采访点状态 |
 | `POST` | `/api/interview/status` | 采访端上报状态 |
@@ -170,8 +171,7 @@ curl -X POST http://localhost:3000/api/auth/register \
 | 方法 | 路径 | 说明 |
 | :--- | :--- | :--- |
 | `GET` | `/api/auth/profile` | 当前用户 |
-| `POST` | `/api/locks/:projectId/acquire` | 抢占控制权 |
-| `POST` | `/api/locks/:projectId/release` | 释放控制权 |
+| `POST` | `/api/locks/:projectId/acquire` | 抢占控制权 || `POST` | `/api/locks/:projectId/release` | 释放控制权 |
 | `POST` | `/api/locks/:projectId/heartbeat` | 心跳续期 |
 | `GET` | `/api/locks/:projectId/status` | 控制权状态 |
 | `GET` | `/api/messages/:projectId` | 项目消息（最多 200 条） |
