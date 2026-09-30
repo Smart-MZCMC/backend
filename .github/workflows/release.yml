@@ -309,9 +309,15 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.ver.outputs.version }}
+          # 前面 Resolve version 把开头的 v 剥掉了，所以这里要补回去。
+          # 否则 tag_name 会变成 1.1.0，与实际触发流水线的 v1.1.0 对不上，
+          # action 会另建一个同名 tag 并把 Release 挂过去，结果 v1.1.0 上什么都没有。
+          # 注意客户端 tag 查询（v$VERSION）与这里的 tag_name 必须同一种写法。
+          tag_name: v${{ steps.ver.outputs.version }}
           name: 绵中融媒体智汇导播系统 v${{ steps.ver.outputs.version }}
-          draft: true
+          # 直接公开发布。仓库本身是 public，所以产物一旦发布即可被任何人下载，
+          # 包括后端二进制与两个 APK —— 内网分发场景下请改回 true 走人工确认。
+          draft: false
           generate_release_notes: true
           body: |
             ## 部署
