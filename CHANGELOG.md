@@ -52,6 +52,23 @@
 - 采访端配置改为**运行期可改**（`public/interviewer/config.json`），换服务器地址
   不必重新构建。
 
+### 客户端包名与签名
+
+> ⚠️ **不兼容变更**：两个客户端的应用包名从 Flutter 模板残留的 `com.example.*`
+> 改为 `top.laobinghu.smart.mzcmc.*`，并且改用正式签名证书。**已安装过旧包的设备
+> 必须先卸载旧版再装新版**，因为签名变了，包名也变了，系统不会当作同一个应用升级。
+> 卸载会清掉该应用的本地数据。
+
+- 导播端 `com.example.director` → `top.laobinghu.smart.mzcmc.director`
+- 采访端 → `top.laobinghu.smart.mzcmc.interviewer`
+  （原值误写成 `com.example.director`，与导播端撞包名，两端无法共存于同一设备）
+- 两个客户端由 debug 签名改为正式签名（`alias=upload`，RSA 2048，有效期至 2054 年），
+  现在可以覆盖安装、不再受 debug 证书限制。
+- keystore 不进版本库：`android/key.properties` 已被 `android/.gitignore` 忽略；
+  流水线从后端仓库的 `ANDROID_KEYSTORE_*` secrets 读取。**keystore 文件本身必须长期
+  备份**——丢失后无法再为已发布的应用签出可覆盖升级的包。
+- Android 7.0+（`minSdk=24`）起 v2 签名即可，v1 已不再生成。
+
 ### 运维
 
 - 静态 HTML 补 `Cache-Control`，避免改完首页浏览器仍显示旧内容。

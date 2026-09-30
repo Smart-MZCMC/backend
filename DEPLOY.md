@@ -385,22 +385,48 @@ Publish。理由是 APK 和域名相关配置出错时后果比较直接，值�
 没配则退回 **debug 签名**，工作流会打 `::warning::` 提示。这种包无法覆盖安装、
 无法上架，只适合内网测试。
 
-生成 keystore：
+生成 keystore（`PKCS12` 是现在的标准格式，keytool 会对 JKS 给出迁移提示）：
 
 ```sh
-keytool -genkey -v -keystore upload-keystore.jks \
+keytool -genkeypair -keystore upload-keystore.jks -storetype PKCS12 \
         -keyalg RSA -keysize 2048 -validity 10000 -alias upload
 base64 -w0 upload-keystore.jks
 ```
 
+> PKCS12 要求 store 与 key 用同一个密码，`-keypass` 传不同值会被 keytool 忽略并
+> 告警。工作流的 `ANDROID_KEYSTORE_PASSWORD` 与 `ANDROID_KEY_PASSWORD` 填同一个值即可。
+
 正式签名时工作流还会解包 APK 检查签名块是否真的存在，签名没生效会直接失败
 ——否则正式包和 debug 包长得一模一样，发出去才发现。
 
-### `applicationId` 还是模板默认值
+### 应用包名与签名已定稿
 
-两个 APK 的 `applicationId` 目前是 Flutter 模板默认的
-`com.example.director` / `com.example.interviewer`。**正式分发前应改成自己的
-反向域名**（例如 `cn.edu.mzjc.director`），改在各自的
-`android/app/build.gradle.kts` 里 `applicationId` 与 `namespace` 两处。
+包名已从模板残留值改为自有反向域名，**1.1.0 起不可再改**：
 
-注意：**一旦改过并分发过就不能再改**，否则系统会当成另一个应用，无法覆盖安装。
+| 端 | `applicationId` |
+| --- | --- |
+| 导播端 | `top.laobinghu.smart.mzcmc.director` |
+| 采访端 | `top.laobinghu.smart.mzcmc.interviewer` |
+
+注意三处必须一致：gradle 里的 `namespace`、`applicationId`，以及
+`MainActivity.kt` 的 `package` 声明。AndroidManifest 里 activity 写的是
+`android:name=".MainActivity"`，这个简写按 `namespace` 解析 —— 只改
+`namespace` 而忘了 `MainActivity`，会直接编译失败（解析出来的类不存在）。
+
+> `namespace` 与 `applicationId` 是两回事：前者决定 R 类 / BuildConfig 的生成
+> 包名，后者才是装到设备上的包标识。只改 `namespace` 对安装包名毫无作用。
+
+签名：`alias=upload`，RSA 2048，PKCS12，有效期至 2054 年，两个客户端共用一把。
+证书 SHA-256：
+
+```
+D0:41:83:95:E4:E8:F7:30:C8:53:9F:62:5C:8F:23:76:EA:C9:38:93:67:6C:F2:DF:BE:20:9A:BC:58:06:A5:66
+```
+
+> **keystore 必须长期备份。** 丢失后无法再为已发布的应用签出可覆盖升级的包，
+> 只能让所有人卸载重装（本地数据会丢）。它不在版本库里，只存在于后端仓库的
+> `ANDROID_KEYSTORE_*` secrets 与你自己的备份中。
+
+本地构建要用同一把密钥签，需要在各客户端目录下放 `android/key.properties`
+（已被 `android/.gitignore` 忽略），字段见 `backend/android/key.properties.tmpl`。
+不放则退回 debug 签名——那种包无法覆盖安装，也无法上架。
