@@ -9,7 +9,7 @@ import (
 type StatusController struct{}
 
 // Version 当前后端版本号。会随发布手动同步，改动见 CHANGELOG。
-const Version = "1.2.0"
+const Version = "1.3.0"
 
 // MinClientVersion 是所有客户端都必须满足的最低适配版本。
 //
@@ -23,7 +23,7 @@ const Version = "1.2.0"
 //   - MinClientVersion <= 客户端 < Version：只是落后，软提示建议更新
 //
 // 什么时候该动它：只有在引入了老客户端无法承受的后端改动时才上调，平时不动。
-const MinClientVersion = "1.2.0"
+const MinClientVersion = "1.3.0"
 
 func NewStatusController() *StatusController {
 	return &StatusController{}

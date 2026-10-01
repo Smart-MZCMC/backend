@@ -5,8 +5,8 @@
 > **这些包从哪来？** GitHub Releases。给本仓库打 tag 即自动构建发布：
 >
 > ```sh
-> git tag v1.2.0
-> git push origin v1.2.0
+> git tag v1.3.0
+> git push origin v1.3.0
 > ```
 >
 > 工作流会构建后端发布包与两个客户端 APK，产出草稿 Release（**默认不直接发布**，
@@ -223,7 +223,7 @@ CREATE UNIQUE INDEX users_email_unique ON users(email)
 改的位置是 `app/http/controllers/status_controller.go`：
 
 ```go
-const MinClientVersion = "1.2.0"
+const MinClientVersion = "1.3.0"
 ```
 
 > **不要改成「客户端版本必须等于后端版本」。** 那样每次后端发新版——哪怕只是
@@ -356,8 +356,8 @@ systemd 单元里确认有 `Restart=always`（单元文件里已经带了）。
 打 tag 即触发 `.github/workflows/release.yml`：
 
 ```sh
-git tag v1.2.0
-git push origin v1.2.0
+git tag v1.3.0
+git push origin v1.3.0
 ```
 
 产物：
@@ -379,7 +379,7 @@ git push origin v1.2.0
 
 ```sh
 for r in admin docs director interviewer; do
-  git -C ../$r tag v1.2.0 && git -C ../$r push origin v1.2.0
+  git -C ../$r tag v1.3.0 && git -C ../$r push origin v1.3.0
 done
 ```
 
