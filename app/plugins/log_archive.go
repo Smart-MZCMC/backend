@@ -105,6 +105,11 @@ func (l *LogArchive) SetPresenceScanner(fn func(time.Duration)) {
 	l.presenceScan = fn
 }
 
+// hasPresenceScanner 报告是否已经注入掉线扫描函数。
+func (l *LogArchive) hasPresenceScanner() bool {
+	return l.presenceScan != nil
+}
+
 func (l *LogArchive) Describe() Descriptor {
 	return Descriptor{
 		Name:        l.Name(),
@@ -248,8 +253,11 @@ type ExportRange struct {
 
 // parseTimeParam 解析导出接口的时间参数。
 //
-// 同时接受 RFC3339 与「2026-01-02」两种写法：前者是接口文档里的形式，
-// 后者是人在浏览器里手敲或从管理后台日期选择器上直接拿到的形式。
+// 同时接受 RFC3339、「2026-01-02」、「2026-01-02 15:04:05」以及
+// **没有秒**的 `2026-01-02T15:04`：最后一种是浏览器
+// `<input type="datetime-local">` 的默认提交格式，管理后台的导出按钮用的
+// 就是它。少了这一条，界面上选完时间一导出就是 400，而错误信息完全指不到
+// 真正的原因。
 func parseTimeParam(raw string) (time.Time, error) {
 	if raw == "" {
 		return time.Time{}, nil
@@ -257,7 +265,9 @@ func parseTimeParam(raw string) (time.Time, error) {
 	layouts := []string{
 		time.RFC3339,
 		"2006-01-02T15:04:05",
+		"2006-01-02T15:04",
 		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
 		"2006-01-02",
 	}
 	for _, layout := range layouts {
@@ -266,6 +276,11 @@ func parseTimeParam(raw string) (time.Time, error) {
 		}
 	}
 	return time.Time{}, fmt.Errorf("无法解析的时间格式 %q", raw)
+}
+
+// isDateOnlyParam 报告时间参数是不是「只有日期」。
+func isDateOnlyParam(raw string) bool {
+	return len(raw) == len("2006-01-02")
 }
 
 // parseExportRange 读取并校验导出接口的 from/to 参数。
@@ -285,8 +300,9 @@ func parseExportRange(ctx http.Context) (ExportRange, error) {
 		return ExportRange{}, fmt.Errorf("必须提供 from 与 to 时间范围（示例：2026-01-01 与 2026-02-01）")
 	}
 	// 「只有日期」的 to 要算到当天结束，否则用户选到 2 月 1 日却拿不到
-	// 2 月 1 日当天的数据，看起来像丢数据。
-	if to.Hour() == 0 && to.Minute() == 0 && to.Second() == 0 {
+	// 2 月 1 日当天的数据，看起来像丢数据。带具体时刻的不加，那是用户
+	// 明确指定的截止点。
+	if isDateOnlyParam(ctx.Request().Input("to", "")) {
 		to = to.Add(24*time.Hour - time.Nanosecond)
 	}
 	if !to.After(from) {

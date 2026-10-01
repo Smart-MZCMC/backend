@@ -39,8 +39,12 @@ func (c *MessageController) ListByProject(ctx http.Context) http.Response {
 // maxLogLimit 是 /api/logs 单页返回的上限。
 const maxLogLimit = 500
 
-// parseTimeFilter 解析日志筛选用的时间参数，支持 RFC3339 与纯日期。
-// 解析不出来时返回零值 + false，由调用方决定是报错还是忽略。
+// parseTimeFilter 解析日志筛选用的时间参数。
+//
+// 必须接受 `YYYY-MM-DDTHH:mm` 这种**没有秒**的写法：浏览器的
+// `<input type="datetime-local">` 默认就是分钟精度，管理后台的时间筛选控件
+// 直接把它提交上来。少了这一条，界面上选完时间一查询就是 400
+// 「from 时间格式不正确」，而这个错误信息完全指不到真正的原因。
 func parseTimeFilter(raw string) (time.Time, bool) {
 	if raw == "" {
 		return time.Time{}, false
@@ -48,7 +52,9 @@ func parseTimeFilter(raw string) (time.Time, bool) {
 	for _, layout := range []string{
 		time.RFC3339,
 		"2006-01-02T15:04:05",
+		"2006-01-02T15:04",
 		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
 		"2006-01-02",
 	} {
 		if t, err := time.ParseInLocation(layout, raw, time.Local); err == nil {
@@ -56,6 +62,14 @@ func parseTimeFilter(raw string) (time.Time, bool) {
 		}
 	}
 	return time.Time{}, false
+}
+
+// isDateOnly 报告一个时间参数是不是「只有日期、没有时间」。
+//
+// 用它来决定「结束时间要不要补到当天 23:59:59」：用户选到 2 月 1 日，
+// 期望的是包含 2 月 1 日整天，而不是 2 月 1 日 00:00 之前。
+func isDateOnly(raw string) bool {
+	return len(raw) == len("2006-01-02")
 }
 
 // ListLogs 按条件分页查询协调日志。
@@ -99,8 +113,9 @@ func (c *MessageController) ListLogs(ctx http.Context) http.Response {
 	}
 	if to, ok := parseTimeFilter(toRaw); ok {
 		// 纯日期的 to 要算到当天结束，否则用户选到 2 月 1 日却拿不到当天的
-		// 记录，看起来像丢数据。
-		if len(toRaw) == len("2006-01-02") {
+		// 记录，看起来像丢数据。带具体时刻的（含 datetime-local 的分钟精度）
+		// 不加，那是用户明确指定的截止点。
+		if isDateOnly(toRaw) {
 			to = to.Add(24*time.Hour - time.Nanosecond)
 		}
 		query = query.Where("created_at <= ?", to)
