@@ -138,6 +138,7 @@ func writeFile(ctx http.Context, file string) bool {
 // 根本不回源请求——改完首页刷新却还是旧内容，就是这么来的。
 //
 // 规则：
+//   - _app/version.json 必须每次回源校验，且**不能**吃 immutable。
 //   - HTML 文档（index.html / 404.html / VitePress 页面）必须每次回源校验，
 //     否则更新站点后用户会一直看到旧页面。no-cache 不是「不缓存」，
 //     它允许存储但强制先向服务器确认，命中 304 时不重复传输。
@@ -146,6 +147,20 @@ func writeFile(ctx http.Context, file string) bool {
 func cacheControlFor(file string) string {
 	slash := filepath.ToSlash(file)
 	switch {
+	case strings.HasSuffix(slash, "/_app/version.json"), slash == "_app/version.json":
+		// ⚠️ 这条规则必须排在 /_app/ 那条**前面**，否则会被 immutable 吃掉。
+		//
+		// SvelteKit 的自动更新检测完全依赖这个文件：构建时把版本号内联进
+		// entry JS，运行时 fetch 它并与内联值比对，不一致就硬刷新。路径固定、
+		// 内容每次构建都变——与「文件名带哈希所以可以 immutable」正好相反。
+		//
+		// 给了 immutable + max-age=31536000 之后，浏览器一年都不会回源，
+		// 版本号永远比对不出来，于是**前端永远不更新**：页面看着正常、
+		// 数据也在动，但跑的是几个月前的 JS。现场只表现为「更新没生效」。
+		//
+		// 前端 fetch 虽然带了 cache-control: no-cache 请求头，但 immutable
+		// 是强化指令，浏览器对它的处理比普通缓存指令强硬得多，实际不会回源。
+		return "no-cache, must-revalidate"
 	case strings.Contains(slash, "/_app/"):
 		return "public, max-age=31536000, immutable"
 	case strings.EqualFold(filepath.Ext(file), ".html"), strings.EqualFold(filepath.Ext(file), ".htm"):
