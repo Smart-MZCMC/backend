@@ -449,11 +449,12 @@ func (c *AdminController) AssignProject(ctx http.Context) http.Response {
 
 	// 先确认两边都存在：授权记录本身没有外键约束，写进一个不存在的
 	// project_id 会让后台显示一条指向「项目 #999」的幽灵授权。
-	if _, err := loadUser(userID); err != nil {
+	user, err := loadUser(userID)
+	if err != nil {
 		return ctx.Response().Json(404, map[string]any{"error": "用户不存在"})
 	}
 	var project models.Project
-	if err := facades.Orm().Query().Select("id").Where("id = ?", projectID).
+	if err := facades.Orm().Query().Where("id = ?", projectID).
 		First(&project); err != nil || project.ID == 0 {
 		return ctx.Response().Json(404, map[string]any{"error": "项目不存在"})
 	}
@@ -477,7 +478,31 @@ func (c *AdminController) AssignProject(ctx http.Context) http.Response {
 		Detail:     map[string]any{"user_id": userID, "project_id": projectID},
 	})
 
-	return ctx.Response().Json(201, up)
+	// 手工组装响应，不要直接返回 up。
+	//
+	// UserProject 上挂着 User / Project 两个关联字段（GORM 的 eager-load 目标），
+	// 而这里并没有 Preload 它们，于是序列化出去是两个**全零值对象**：
+	// {"id":0,"username":"","role":""...}。前端拿它渲染会显示一个空白用户。
+	// 这个接口此前一直这么返回。A2 之后这张表决定着「谁能看哪个项目」，
+	// 返回值更不能有误导。
+	return ctx.Response().Json(201, map[string]any{
+		"id":         up.ID,
+		"user_id":    up.UserID,
+		"project_id": up.ProjectID,
+		"created_at": up.CreatedAt,
+		"user": map[string]any{
+			"id":           user.ID,
+			"username":     user.Username,
+			"display_name": user.DisplayName,
+			"role":         user.Role,
+			"role_label":   models.Role(user.Role).Label(),
+		},
+		"project": map[string]any{
+			"id":   project.ID,
+			"name": project.Name,
+			"code": project.Code,
+		},
+	})
 }
 
 func (c *AdminController) RevokeProject(ctx http.Context) http.Response {

@@ -258,21 +258,31 @@ type ExportRange struct {
 // `<input type="datetime-local">` 的默认提交格式，管理后台的导出按钮用的
 // 就是它。少了这一条，界面上选完时间一导出就是 400，而错误信息完全指不到
 // 真正的原因。
+//
+// **返回值一律转成 UTC**：参数是用户所在时区的墙上时间，而 `created_at`
+// 存的是 UTC。按本地时区构造条件会恒定差一个时区偏移（东八区 8 小时），
+// 于是「导出最近 7 天」会导出一份空文件却不报错。
+// 同样的道理见 app/http/controllers/message_controller.go 的 parseTimeFilter。
 func parseTimeParam(raw string) (time.Time, error) {
 	if raw == "" {
 		return time.Time{}, nil
 	}
-	layouts := []string{
-		time.RFC3339,
+	// RFC3339 自带时区偏移，按其字面时刻解析。**必须先试它**：
+	// 下面那几个 layout 都不含时区信息，time.Parse 同样能解析成功，只是当成
+	// UTC，放在循环里逐个试的话会把它们全部先吃掉，时区换算等于没做。
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t.UTC(), nil
+	}
+	// 其余格式是墙上时间，按本地时区理解用户意图再换算成 UTC。
+	for _, layout := range []string{
 		"2006-01-02T15:04:05",
 		"2006-01-02T15:04",
 		"2006-01-02 15:04:05",
 		"2006-01-02 15:04",
 		"2006-01-02",
-	}
-	for _, layout := range layouts {
+	} {
 		if t, err := time.ParseInLocation(layout, raw, time.Local); err == nil {
-			return t, nil
+			return t.UTC(), nil
 		}
 	}
 	return time.Time{}, fmt.Errorf("无法解析的时间格式 %q", raw)

@@ -45,12 +45,37 @@ const maxLogLimit = 500
 // `<input type="datetime-local">` 默认就是分钟精度，管理后台的时间筛选控件
 // 直接把它提交上来。少了这一条，界面上选完时间一查询就是 400
 // 「from 时间格式不正确」，而这个错误信息完全指不到真正的原因。
+//
+// **返回值一律转成 UTC**，这一点是本函数存在的关键：
+//
+// 接口收到的是**用户所在时区的墙上时间**（`datetime-local` 控件就是这么给
+// 的，比如东八区的「20:30」），而 `messages.created_at` 存的是 UTC。
+// 这里若按本地时区构造条件值，ORM 序列化后拿去与库里的 UTC 字符串比较，
+// 就恒定差一个时区偏移——东八区偏 8 小时，于是「最近 7 天」这类筛选
+// 一个都命中不了，而接口返回 200、total=0，看起来像「这段时间没日志」。
+//
+// 这个 bug 实测过：库里 30 条记录，用本地时间窗口查 total=0，用 UTC 窗口
+// 查 total=30。所以 `app/plugins/log_archive.go` 的 parseTimeParam 也有
+// 同样的问题，两处必须一致。
 func parseTimeFilter(raw string) (time.Time, bool) {
 	if raw == "" {
 		return time.Time{}, false
 	}
+
+	// RFC3339 自带时区偏移（末尾的 Z 或 ±hh:mm），必须按其字面时刻解析，
+	// 且要放在最前面试。
+	//
+	// 顺序很关键：下面那几个 layout 都不含时区信息，time.Parse 对它们同样
+	// 能解析成功，只是**当成 UTC**。所以若把 time.Parse 放在循环里逐个试，
+	// 无时区信息的写法会全部被它先吃掉、按 UTC 处理，本地时区那条分支永远
+	// 走不到 —— 于是「东八区 09:30」又被算成「UTC 09:30」，时区换算等于
+	// 没做（这个坑真踩过一次）。
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t.UTC(), true
+	}
+
+	// 其余格式是「墙上时间」，按本地时区理解用户意图再换算成 UTC。
 	for _, layout := range []string{
-		time.RFC3339,
 		"2006-01-02T15:04:05",
 		"2006-01-02T15:04",
 		"2006-01-02 15:04:05",
@@ -58,7 +83,7 @@ func parseTimeFilter(raw string) (time.Time, bool) {
 		"2006-01-02",
 	} {
 		if t, err := time.ParseInLocation(layout, raw, time.Local); err == nil {
-			return t, true
+			return t.UTC(), true
 		}
 	}
 	return time.Time{}, false

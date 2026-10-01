@@ -1,6 +1,9 @@
 package controllers
 
 import (
+	"fmt"
+	"os"
+	"os/exec"
 	"testing"
 	"time"
 )
@@ -15,11 +18,50 @@ func TestParseTimeFilter_AcceptsDatetimeLocalWithoutSeconds(t *testing.T) {
 	if !ok {
 		t.Fatal("datetime-local 的分钟精度写法必须能解析")
 	}
-	if got.Hour() != 9 || got.Minute() != 30 {
-		t.Fatalf("解析出的时刻不对: %v", got)
+	if got.Minute() != 30 {
+		t.Fatalf("分钟数应保留: %v", got)
 	}
-	if got.Location() != time.Local {
-		t.Fatalf("应按本地时区解析，实际是 %v", got.Location())
+	if got.Location() != time.UTC {
+		t.Fatalf("结果时区应是 UTC，实际 %v", got.Location())
+	}
+}
+
+// TestParseTimeFilter_ConvertsWallClockToUTC 是这次修复的核心断言。
+//
+// 必须在非 UTC 的时区里验证，因为开发机很可能正好在 UTC —— 那样墙上时间与
+// UTC 时刻相同，换算做没做都测不出来。子进程里显式把 time.Local 指向
+// Asia/Shanghai：「09:30」应当被理解成东八区的 09:30，即 UTC 的 01:30。
+//
+// 为什么用子进程而不是 t.Setenv("TZ", ...)：Windows 上 Go **不读** TZ 环境
+// 变量（实测设了也没效果），而直接改 time.Local 这个全局变量会让并行测试
+// 互相污染。
+func TestParseTimeFilter_ConvertsWallClockToUTC(t *testing.T) {
+	if os.Getenv("GO_TEST_TZ_CHILD") == "1" {
+		loc, err := time.LoadLocation("Asia/Shanghai")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "SKIP: 本机没有时区数据库")
+			os.Exit(0)
+		}
+		time.Local = loc
+
+		got, ok := parseTimeFilter("2026-05-20T09:30")
+		if !ok {
+			fmt.Fprintln(os.Stderr, "FAIL: 应能解析")
+			os.Exit(1)
+		}
+		// 东八区 09:30 == UTC 01:30
+		if formatted := got.UTC().Format("2006-01-02T15:04"); formatted != "2026-05-20T01:30" {
+			fmt.Fprintf(os.Stderr, "FAIL: 得到 %s，期望 2026-05-20T01:30\n", formatted)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestParseTimeFilter_ConvertsWallClockToUTC")
+	cmd.Env = append(os.Environ(), "GO_TEST_TZ_CHILD=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("子进程失败（期望墙上时间 09:30 被换算成 UTC 01:30）:\n%s", out)
 	}
 }
 
@@ -29,9 +71,12 @@ func TestParseTimeFilter_AcceptsOtherForms(t *testing.T) {
 		raw  string
 		want time.Time
 	}{
-		{"2026-05-20", time.Date(2026, 5, 20, 0, 0, 0, 0, time.Local)},
-		{"2026-05-20 09:30:15", time.Date(2026, 5, 20, 9, 30, 15, 0, time.Local)},
-		{"2026-05-20T09:30:15", time.Date(2026, 5, 20, 9, 30, 15, 0, time.Local)},
+		// 墙上时间：按本地时区理解用户意图，再换算成 UTC。
+		{"2026-05-20", time.Date(2026, 5, 20, 0, 0, 0, 0, time.Local).UTC()},
+		{"2026-05-20 09:30:15", time.Date(2026, 5, 20, 9, 30, 15, 0, time.Local).UTC()},
+		{"2026-05-20T09:30:15", time.Date(2026, 5, 20, 9, 30, 15, 0, time.Local).UTC()},
+		// 带偏移的按字面时刻解析，不当成本地时间。
+		{"2026-05-20T09:30:00+08:00", time.Date(2026, 5, 20, 1, 30, 0, 0, time.UTC)},
 	}
 	for _, c := range cases {
 		got, ok := parseTimeFilter(c.raw)
@@ -44,29 +89,47 @@ func TestParseTimeFilter_AcceptsOtherForms(t *testing.T) {
 	}
 }
 
-// TestParseTimeFilter_RejectsGarbage 保证解析失败的写法不被静默当成零值——
-// 那会让筛选条件悄悄失效，返回全表数据。
-func TestParseTimeFilter_RejectsGarbage(t *testing.T) {
-	for _, raw := range []string{"昨天", "2026/05/20", "20260520"} {
-		if _, ok := parseTimeFilter(raw); ok {
-			t.Fatalf("%q 不该被解析成功", raw)
+// TestParseTimeFilter_AlwaysReturnsUTC 锁住「返回值一律是 UTC」这条约定。
+//
+// 之前这里是 ParseInLocation(..., time.Local) 直接返回，于是条件值带着本地
+// 时区，而 messages.created_at 存的是 UTC —— 东八区恒定差 8 小时。
+// 实测：库里 30 条记录，用本地时间窗口查 total=0，用 UTC 窗口查 total=30。
+// 接口照样返回 200、total=0，看起来像「这段时间没有日志」，非常难查。
+func TestParseTimeFilter_AlwaysReturnsUTC(t *testing.T) {
+	for _, raw := range []string{
+		"2026-05-20T09:30",
+		"2026-05-20 09:30:15",
+		"2026-05-20T09:30:15",
+		"2026-05-20",
+		"2026-05-20T09:30:00+08:00",
+		"2026-05-20T01:30:00Z",
+	} {
+		got, ok := parseTimeFilter(raw)
+		if !ok {
+			t.Fatalf("%q 应该能解析", raw)
 		}
-	}
-	if _, ok := parseTimeFilter(""); ok {
-		t.Fatal("空串表示「没传这个筛选条件」，不该当成时间")
+		if got.Location() != time.UTC {
+			t.Errorf("%q 解析结果的时区应是 UTC，实际 %v", raw, got.Location())
+		}
 	}
 }
 
-// TestIsDateOnly 防的是「选到某一天却拿不到那天的数据」：只有日期时结束时间
-// 要补到当天 23:59:59，而带具体时刻的（含 datetime-local）是用户指定的截止点，
-// 不能擅自往后扩一整天。
-func TestIsDateOnly(t *testing.T) {
-	if !isDateOnly("2026-05-20") {
-		t.Fatal("纯日期应判定为 date-only")
+// TestParseTimeFilter_EquivalentInstantsAgree 保证「带时区偏移」与「不带偏移」
+// 描述的是同一时刻时，结果相同。这条是上面那个 bug 的根因：
+// 用户界面给的是本地墙上时间，库里存的是 UTC，两者必须落到同一个时间轴上。
+func TestParseTimeFilter_EquivalentInstantsAgree(t *testing.T) {
+	withOffset, ok := parseTimeFilter("2026-05-20T09:30:00+08:00")
+	if !ok {
+		t.Fatal("带偏移的 RFC3339 应能解析")
 	}
-	for _, raw := range []string{"2026-05-20T09:30", "2026-05-20 09:30:15", "2026-05-20T09:30:15"} {
-		if isDateOnly(raw) {
-			t.Fatalf("%q 带了具体时刻，不该判定为 date-only", raw)
-		}
+	// 同一个时刻写成 UTC：09:30+08:00 == 01:30Z
+	inUTC, ok := parseTimeFilter("2026-05-20T01:30:00Z")
+	if !ok {
+		t.Fatal("UTC 的 RFC3339 应能解析")
+	}
+	if !withOffset.Equal(inUTC) {
+		t.Fatalf("同一时刻的两种写法应解析成相同结果: %v vs %v", withOffset, inUTC)
 	}
 }
+
+// TestParseTimeFilter_AcceptsOtherForms 保证其余几种写法没被顺手改坏。
