@@ -2,12 +2,14 @@ package plugins
 
 import (
 	"fmt"
+	"log"
 	"strconv"
 	"time"
 
 	"github.com/goravel/framework/contracts/http"
 	"github.com/goravel/framework/facades"
 
+	"smart-mzcmc/app/audit"
 	"smart-mzcmc/app/models"
 )
 
@@ -67,42 +69,56 @@ func ProjectStatsHandler(ctx http.Context) http.Response {
 
 	interviewCount, _ := facades.Orm().Query().Model(&models.InterviewStatus{}).Where("project_id = ?", projectID).Count()
 
+	// 切台统计。shot_cuts 是这一轮新增的表，有了它，「这个项目切了多少次台」
+	// 才是一个能查出来的事实，而不是靠翻 messages 里的 JSON 猜。
+	cutCount, _ := facades.Orm().Query().Model(&models.ShotCut{}).
+		Where("project_id = ?", projectID).Count()
+	avgDwell := averageShotDwell(uint(projectID))
+
 	return ctx.Response().Json(200, map[string]any{
-		"project_id":       projectID,
-		"message_count":    msgCount,
-		"lock_active":      lockActive,
-		"lock_holder":      lock.UserID,
-		"interview_points": interviewCount,
-		"timestamp":        time.Now().Format(time.RFC3339),
+		"project_id":             projectID,
+		"message_count":          msgCount,
+		"lock_active":            lockActive,
+		"lock_holder":            lock.UserID,
+		"interview_points":       interviewCount,
+		"shot_cut_count":         cutCount,
+		"avg_shot_dwell_seconds": avgDwell,
+		"timestamp":              time.Now().Format(time.RFC3339),
 	})
 }
 
-// ExportProjectLogsHandler 导出项目完整日志
-func ExportProjectLogsHandler(ctx http.Context) http.Response {
-	projectIDStr := ctx.Request().Input("project_id", "0")
-	projectID, _ := strconv.ParseUint(projectIDStr, 10, 64)
-	if projectID == 0 {
-		return ctx.Response().Json(400, map[string]any{"error": "需要 project_id 参数"})
-	}
-
-	var messages []models.Message
-	if err := facades.Orm().Query().
+// averageShotDwell 返回平均停留时长（秒）。
+//
+// 最后一段没有后续切台，停留多久无从得知，所以不参与平均——按「到现在为止」
+// 算会让这个数字随着你盯着屏幕的时间不断变大。
+func averageShotDwell(projectID uint) float64 {
+	var cuts []models.ShotCut
+	if err := facades.Orm().Query().Select("to_shot", "cut_at").
 		Where("project_id = ?", projectID).
-		With("Sender").
-		OrderByDesc("created_at").
-		Limit(1000).
-		Find(&messages); err != nil {
-		return ctx.Response().Json(500, map[string]any{"error": "查询日志失败"})
+		OrderBy("cut_at").Find(&cuts); err != nil || len(cuts) < 2 {
+		return 0
 	}
 
-	return ctx.Response().Json(200, map[string]any{
-		"project_id": projectID,
-		"count":      len(messages),
-		"messages":   messages,
-	})
+	var total float64
+	segments := 0
+	for i := 0; i+1 < len(cuts); i++ {
+		dwell := cuts[i+1].CutAt.Sub(cuts[i].CutAt).Seconds()
+		if dwell < 0 {
+			continue
+		}
+		total += dwell
+		segments++
+	}
+	if segments == 0 {
+		return 0
+	}
+	return total / float64(segments)
 }
 
 // CleanupLogsHandler 手动清理过期日志
+//
+// 这个接口会真的删数据，而删除的历史记录本身就是审计对象——所以清理动作
+// 必须自己留下痕迹，否则「谁把证据清了」永远查不出来。
 func CleanupLogsHandler(ctx http.Context) http.Response {
 	days, _ := strconv.Atoi(ctx.Request().Input("days", "30"))
 	if days <= 0 {
@@ -113,6 +129,23 @@ func CleanupLogsHandler(ctx http.Context) http.Response {
 	result, err := facades.Orm().Query().Where("created_at < ?", cutoff).Delete(&models.Message{})
 	if err != nil {
 		return ctx.Response().Json(500, map[string]any{"error": fmt.Sprintf("清理失败: %v", err)})
+	}
+
+	if actor, ok := audit.ActorFrom(ctx); ok {
+		audit.Write(ctx, actor, audit.Record{
+			Action:     "logs.cleanup",
+			Summary:    fmt.Sprintf("清理 %d 天前的协调日志，删除 %d 条", days, result.RowsAffected),
+			TargetType: "message",
+			Detail: map[string]any{
+				"days":          days,
+				"rows_affected": result.RowsAffected,
+				"cutoff":        cutoff.Format(time.RFC3339),
+			},
+		})
+	} else {
+		// 走到这里说明路由上的角色守卫没生效，属于配置错误而不是正常路径。
+		// 记下来比静默删掉要好。
+		log.Printf("[Logs] 清理了 %d 条日志，但上下文中没有操作者，未能写入审计", result.RowsAffected)
 	}
 
 	return ctx.Response().Json(200, map[string]any{

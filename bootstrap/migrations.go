@@ -23,5 +23,15 @@ func Migrations() []schema.Migration {
 		&migrations.M20261001000001EnsureSuperAdmin{},
 		// 用户中心：邮箱（WeAvatar 头像来源）与令牌版本（改密码即失效）
 		&migrations.M20261002000001AddUserProfileFields{},
+		// 切台状态落库：让中途连上来的解说端/包装端能立刻拿到当前状态
+		&migrations.M20261101000001CreateProjectStatesTable{},
+		// 切台流水：时间线、机位/时段筛选、次数与停留时长报表
+		&migrations.M20261101000002CreateShotCutsTable{},
+		// 项目日程与状态流转字段
+		&migrations.M20261101000003AddProjectScheduleFields{},
+		// 机位预设由项目自己配置，不再硬编码在导播端
+		&migrations.M20261101000004CreateProjectCamerasTable{},
+		// 敏感操作审计落库，不再只依赖 7 天轮转的 stdout 日志
+		&migrations.M20261101000005CreateAuditLogsTable{},
 	}
 }

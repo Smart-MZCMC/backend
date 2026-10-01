@@ -122,7 +122,7 @@ func (c *SystemController) ApplyUpdate(ctx http.Context) http.Response {
 		return ctx.Response().Json(502, map[string]any{"error": err.Error()})
 	}
 
-	auditAction(actor, "执行在线更新到 "+res.Version)
+	auditAction(ctx, actor, "执行在线更新到 "+res.Version)
 
 	// 先把结果写回去再退出：进程一停，这个响应就发不出去了，
 	// 界面会一直转圈，用户不知道到底成没成。

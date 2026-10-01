@@ -24,6 +24,11 @@ func init() {
 			"retention_days": config.Env("PLUGIN_LOG_RETENTION_DAYS", 30),
 			// 清理检查间隔，支持 Go duration 写法（30s / 5m / 1h）。
 			"check_interval": config.Env("PLUGIN_LOG_CHECK_INTERVAL", "1h"),
+			// 采访端掉线扫描。复用同一个 goroutine 的另一个 ticker——
+			// 采访端走出 WiFi 覆盖范围后 TCP 要很久才报错，没有这条扫描
+			// 导演播端会一直显示绿色「就绪」。
+			"presence_interval": config.Env("PLUGIN_PRESENCE_SCAN_INTERVAL", "60s"),
+			"presence_timeout":  config.Env("PLUGIN_PRESENCE_TIMEOUT", "90s"),
 		},
 
 		// csv-export：日志导出接口（JSON / CSV）。

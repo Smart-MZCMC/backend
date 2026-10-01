@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/goravel/framework/contracts/http"
 	"github.com/goravel/framework/facades"
 
+	"smart-mzcmc/app/audit"
 	"smart-mzcmc/app/models"
 )
 
@@ -355,7 +357,30 @@ func (c *AuthController) UpdateProfile(ctx http.Context) http.Response {
 	}
 
 	log.Printf("[AUTH] 用户 %s(#%d) 更新了个人资料", user.Username, user.ID)
+
+	// 改个人资料本身不是管理操作，但它是「谁在什么时候把邮箱换成了什么」
+	// 的唯一线索——邮箱又是头像取值依据与账号找回凭据，值得留痕。
+	recordAudit(ctx, user, audit.Record{
+		Action:     "user.profile_update",
+		Summary:    "更新个人资料",
+		TargetType: "user",
+		TargetID:   strconv.FormatUint(uint64(user.ID), 10),
+		// 只记改了哪些字段名，不记具体值：邮箱属于个人信息，审计表会被导出。
+		Detail: map[string]any{"fields": changedFields(updates)},
+	})
+
 	return ctx.Response().Json(200, userPayload(updated))
+}
+
+// changedFields 只取更新字段的键名，用于审计。
+func changedFields(updates map[string]any) []string {
+	fields := make([]string, 0, len(updates))
+	for key := range updates {
+		fields = append(fields, key)
+	}
+	// 排序让同样的改动顺序一致，便于比对两条记录。
+	sort.Strings(fields)
+	return fields
 }
 
 // ChangePassword 修改自己的密码。

@@ -86,10 +86,23 @@ func Web() {
 			ar.Post("/projects", adminController.CreateProject)
 			ar.Put("/projects/:id", adminController.UpdateProject)
 			ar.Delete("/projects/:id", adminController.DeleteProject)
+			// 机位预设的增删改。读接口在下面 /api/projects/:projectId/cameras，
+			// 非管理端（导播端）也要读。
+			ar.Post("/projects/:id/cameras", adminController.CreateCamera)
+			ar.Put("/projects/:id/cameras/:cameraId", adminController.UpdateCamera)
+			ar.Delete("/projects/:id/cameras/:cameraId", adminController.DeleteCamera)
 			ar.Post("/assign", adminController.AssignProject)
 			ar.Post("/revoke", adminController.RevokeProject)
 			ar.Get("/users/:id/projects", adminController.ListUserProjects)
 		})
+
+		// 操作审计。它是「谁能操作这套系统」的记录，与协调日志不是一回事，
+		// 所以干脆放进 /api/admin 组，而不是和 /api/logs 共用一组守卫。
+		auditController := controllers.NewAuditController()
+		r.Prefix("/api/admin").Middleware(middleware.RequireRole(models.RoleAdmin)).
+			Group(func(ar route.Router) {
+				ar.Get("/audit-logs", auditController.List)
+			})
 
 		// 系统维护：只有超级管理员。系统更新会替换服务自身的可执行文件并重启进程，
 		// 任何一次误操作都会影响全系统所有客户端，所以不与普通管理权限同级。
@@ -101,7 +114,12 @@ func Web() {
 		})
 
 		lockController := controllers.NewLockController()
-		r.Prefix("/api/locks").Group(func(lr route.Router) {
+		// 项目成员校验挂在这一组上。之前这里的 projectId 直接取自 URL，
+		// 任何登录用户只要猜到编号就能抢任意项目的控制权。
+		//
+		// 开关 REQUIRE_PROJECT_MEMBERSHIP 默认 false，中间件此时只记日志不拦截，
+		// 存量部署不受影响（见 app/http/middleware/project.go）。
+		r.Prefix("/api/locks").Middleware(middleware.RequireProjectMember()).Group(func(lr route.Router) {
 			lr.Post("/:projectId/acquire", lockController.Acquire)
 			lr.Post("/:projectId/release", lockController.Release)
 			lr.Post("/:projectId/heartbeat", lockController.Heartbeat)
@@ -109,12 +127,32 @@ func Web() {
 		})
 
 		messageController := controllers.NewMessageController()
-		r.Get("/api/messages/:projectId", messageController.ListByProject)
 		r.Get("/api/logs", messageController.ListLogs)
+
+		// 非管理端的项目视图。
+		//
+		// 导播端此前调的是 /api/admin/projects，那挂在 RequireRole(RoleAdmin)
+		// 之后——导播的令牌根本拿不到数据，项目下拉恒定是空的。
+		projectController := controllers.NewProjectController()
+		r.Get("/api/projects", projectController.List)
+
+		// 下面这几条都带 projectId，统一挂项目成员校验。
+		// 之前它们从 URL 取 projectId 就直接查库，任何登录用户猜到编号
+		// 就能读任意项目的消息、统计与切台记录。
+		r.Prefix("/api/messages").Middleware(middleware.RequireProjectMember()).
+			Group(func(mr route.Router) {
+				mr.Get("/:projectId", messageController.ListByProject)
+			})
+
+		r.Prefix("/api/projects").Middleware(middleware.RequireProjectMember()).
+			Group(func(pr route.Router) {
+				pr.Get("/:projectId/cameras", projectController.Cameras)
+				pr.Get("/:projectId/shot-cuts", projectController.ShotCuts)
+				pr.Get("/:projectId/stats", plugins.ProjectStatsHandler)
+			})
 
 		// 插件系统 API
 		r.Get("/api/plugins", plugins.ListPluginsHandler)
-		r.Get("/api/projects/:projectId/stats", plugins.ProjectStatsHandler)
 
 		// 日志读取对所有登录用户开放（导播端与管理后台都要看），
 		// 下面把「只读」和「会改动数据」拆成两个等级：

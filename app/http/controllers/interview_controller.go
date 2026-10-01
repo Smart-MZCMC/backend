@@ -1,12 +1,15 @@
 package controllers
 
 import (
+	"encoding/json"
 	"strconv"
+	"time"
 
 	"github.com/goravel/framework/contracts/http"
 	"github.com/goravel/framework/facades"
 
 	"smart-mzcmc/app/models"
+	"smart-mzcmc/app/ws"
 )
 
 type InterviewController struct{}
@@ -97,6 +100,19 @@ func (c *InterviewController) UpdateStatus(ctx http.Context) http.Response {
 		Content:   `{"point_code":"` + pointCode + `","status":"` + status + `"}`,
 	}
 	facades.Orm().Query().Create(&msg)
+
+	// 广播给导播端与包装端。
+	//
+	// 之前这条 HTTP 接口只写库、不广播，而 WebSocket 那条路径只广播、不写库，
+	// 于是「数据库里的状态」和「导播屏幕上看到的状态」永远对不上：走 HTTP
+	// 上报的状态要等导播切项目重新拉取才看得到，走 WS 上报的状态一刷新就没了。
+	// 两条路径现在都既落库又广播。
+	ws.DefaultHub.SendToProjectRoles(uint(projectID), []string{"director", "packaging"}, ws.WSMessage{
+		Type:      "interview_status",
+		ProjectID: uint(projectID),
+		Payload:   json.RawMessage(`{"point_code":` + strconv.Quote(pointCode) + `,"point_name":` + strconv.Quote(interview.PointName) + `,"status":` + strconv.Quote(status) + `}`),
+		Timestamp: time.Now().UnixMilli(),
+	})
 
 	return ctx.Response().Json(200, interview)
 }

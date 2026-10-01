@@ -144,10 +144,10 @@ func del(path string, token string) (int, map[string]any, error) {
 
 // --- 测试变量 ---
 var (
-	adminToken    string
-	projectID     float64
-	directorAID   float64
-	directorBID   float64
+	adminToken  string
+	projectID   float64
+	directorAID float64
+	directorBID float64
 )
 
 // --- 测试用例 ---
@@ -293,11 +293,13 @@ func testAcquireLockB() error {
 }
 
 func testConfirmSwitch() error {
-	// 通过WebSocket发送confirm_switch
+	// 走现行协议 shot_state。confirm_switch / next_shot 已在协议升级时废弃，
+	// 后端收到会回一条「请刷新客户端」并丢弃——继续用旧协议等于这条用例
+	// 根本没验证切台链路。
 	msg := map[string]any{
-		"type":       "confirm_switch",
+		"type":       "shot_state",
 		"project_id": projectID,
-		"payload":    map[string]any{"content": "全景"},
+		"payload":    map[string]any{"current": "全景", "next": ""},
 	}
 	data, _ := json.Marshal(msg)
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL+"?project_id="+strconv.FormatFloat(projectID, 'f', 0, 64)+"&role=director&token="+adminToken, nil)
@@ -331,7 +333,13 @@ func testLogsQuery() error {
 }
 
 func testExportJSON() error {
-	req, _ := http.NewRequest("POST", baseURL+"/api/logs/export", bytes.NewBufferString(`{"project_id":`+strconv.FormatFloat(projectID, 'f', 0, 64)+`}`))
+	// from/to 是必填的：导出接口此前对整个项目历史做无条件 Find，
+	// 既没有时间边界也没有行数上限，一次误点就可能把几百 MB 灌进内存。
+	body := fmt.Sprintf(`{"project_id":%s,"from":%q,"to":%q}`,
+		strconv.FormatFloat(projectID, 'f', 0, 64),
+		time.Now().AddDate(0, 0, -1).Format("2006-01-02"),
+		time.Now().AddDate(0, 0, 1).Format("2006-01-02"))
+	req, _ := http.NewRequest("POST", baseURL+"/api/logs/export", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+adminToken)
 	resp, err := httpClient.Do(req)
@@ -347,7 +355,11 @@ func testExportJSON() error {
 }
 
 func testExportCSV() error {
-	req, _ := http.NewRequest("POST", baseURL+"/api/logs/export/csv", bytes.NewBufferString(`{"project_id":`+strconv.FormatFloat(projectID, 'f', 0, 64)+`}`))
+	body := fmt.Sprintf(`{"project_id":%s,"from":%q,"to":%q}`,
+		strconv.FormatFloat(projectID, 'f', 0, 64),
+		time.Now().AddDate(0, 0, -1).Format("2006-01-02"),
+		time.Now().AddDate(0, 0, 1).Format("2006-01-02"))
+	req, _ := http.NewRequest("POST", baseURL+"/api/logs/export/csv", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+adminToken)
 	resp, err := httpClient.Do(req)

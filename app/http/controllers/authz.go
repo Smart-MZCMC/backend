@@ -2,7 +2,6 @@ package controllers
 
 import (
 	"fmt"
-	"log"
 	"strconv"
 	"strings"
 
@@ -10,6 +9,7 @@ import (
 	"github.com/goravel/framework/contracts/http"
 	"github.com/goravel/framework/facades"
 
+	"smart-mzcmc/app/audit"
 	"smart-mzcmc/app/models"
 )
 
@@ -190,19 +190,31 @@ func guardLastSuperAdmin(target models.User) *authzError {
 	return nil
 }
 
+// recordAudit 把一条审计记录写进 audit_logs（实现在 app/audit 包）。
+//
+// 转一层是为了让本文件的调用点保持简短：审计的动作名与目标拼装规则
+// 集中在这里，写库细节留给 app/audit。
+func recordAudit(ctx http.Context, actor models.User, record audit.Record) {
+	audit.Write(ctx, actor, record)
+}
+
 // auditAction 记录一次敏感操作（系统更新、配置变更等）。
-func auditAction(actor models.User, action string) {
-	log.Printf("[AUTHZ] 操作者 %s(#%d, %s) 执行 %s",
-		actor.Username, actor.ID, models.Role(actor.Role).Label(), action)
+func auditAction(ctx http.Context, actor models.User, action string) {
+	recordAudit(ctx, actor, audit.Record{Action: action, Summary: action})
 }
 
 // auditRoleChange 记录角色与账号的变更。
 //
-// 这些是「谁能操作这套系统」的决定，出事时唯一的线索就是日志。
-// 用标准库 log，与本项目其他控制器保持一致。
-func auditRoleChange(actor, target models.User, action string) {
-	log.Printf("[AUTHZ] 操作者 %s(#%d, %s) 对 %s(#%d, %s) 执行 %s",
-		actor.Username, actor.ID, models.Role(actor.Role).Label(),
-		target.Username, target.ID, models.Role(target.Role).Label(),
-		action)
+// 这些是「谁能操作这套系统」的决定，出事时唯一的线索就是审计记录。
+func auditRoleChange(ctx http.Context, actor, target models.User, action string) {
+	recordAudit(ctx, actor, audit.Record{
+		Action:     "user.role_change",
+		Summary:    action,
+		TargetType: "user",
+		TargetID:   strconv.FormatUint(uint64(target.ID), 10),
+		Detail: map[string]any{
+			"target_username": target.Username,
+			"target_role":     target.Role,
+		},
+	})
 }

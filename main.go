@@ -130,12 +130,17 @@ func initPlugins() {
 		Topic:   cfg.GetString("plugins.ntfy.topic", ""),
 	}))
 
-	// log-archive：定期清理过期日志
+	// log-archive：定期清理过期日志 + 扫描失联的采访端
 	archive := plugins.NewLogArchive(plugins.LogArchiveConfig{
-		Enabled:       cfg.GetBool("plugins.log_archive.enabled", true),
-		RetentionDays: cfg.GetInt("plugins.log_archive.retention_days", 30),
-		CheckInterval: cfg.GetString("plugins.log_archive.check_interval", "1h"),
+		Enabled:          cfg.GetBool("plugins.log_archive.enabled", true),
+		RetentionDays:    cfg.GetInt("plugins.log_archive.retention_days", 30),
+		CheckInterval:    cfg.GetString("plugins.log_archive.check_interval", "1h"),
+		PresenceInterval: cfg.GetString("plugins.log_archive.presence_interval", "60s"),
+		PresenceTimeout:  cfg.GetString("plugins.log_archive.presence_timeout", "90s"),
 	})
+	// 注入掉线扫描。用回调而不是让 plugins 反向 import app/ws：ws 已经
+	// import 了 plugins（要发插件事件），反过来就成环了。
+	archive.SetPresenceScanner(ws.ScanStaleClients)
 	plugins.Register(archive)
 	archive.Start() // 内部会判断是否启用
 

@@ -31,17 +31,37 @@ type WSMessage struct {
 //   - Current 当前正在播送的机位
 //   - Next    本次要切过去的机位（切过去之后即成为新的 Current）
 //
-// 接收端不再需要自己推断「正在播送」，直接读 Current 即可；
-// 这也让后加入项目的解说端/包装端能立刻拿到状态，而不必等下一次切台。
+// 接收端不再需要自己推断「正在播送」，直接读 Current 即可。
+//
+// 注意：广播本身只发生在新状态到来的那一刻，所以「后加入的解说端能立刻拿到
+// 状态」曾经是**假的**——中途连上来的人会一直停在「等待导播指令」，重连
+// 同理。真正让这句话成立的是 project_states 表：握手时的欢迎消息会把
+// WelcomePayload 里的 current_shot 一并带上，见 buildWelcome。
 type ShotStatePayload struct {
 	Current string `json:"current"`
 	Next    string `json:"next"`
+}
+
+// WelcomePayload 是连接建立后第一条 system 消息的载荷。
+//
+// 带上当前切台状态，是为了让「中途连接」与「断线重连」这两种情况不用等
+// 下一次切台就能显示正确内容。StateAvailable 为 false 表示这个项目还没有
+// 过任何切台，客户端应保持「等待导播指令」，而不是显示空机位名。
+type WelcomePayload struct {
+	Message        string `json:"message"`
+	OnlineCount    int    `json:"online_count"`
+	CurrentShot    string `json:"current_shot"`
+	NextShot       string `json:"next_shot"`
+	StateAvailable bool   `json:"state_available"`
 }
 
 // IsHeartbeat 判断消息是否只是保活心跳。
 //
 // 心跳由客户端每 10 秒发一次，属于「不算数」的消息：既不写入 messages 表，
 // 也不广播给同项目的其他端，因此不会污染日志、不会计入项目消息统计。
+//
+// 心跳只用来刷新客户端的 LastSeen（见 Client.touch），后台扫描据此判断
+// 采访端是否已经掉线。
 func IsHeartbeat(msg WSMessage) bool {
 	if msg.Type != "chat" {
 		return false
@@ -75,9 +95,32 @@ type Client struct {
 	ProjectID uint
 	UserID    uint
 	Role      string
+	// PointCode 只在采访端连接上非空（来自查询参数）。
+	// 没有它就无法回答「掉线的是哪个采访点」，后台扫描也就无从下手。
+	PointCode string
 	Hub       *Hub
 	Send      chan []byte
 	mu        sync.Mutex
+	// LastSeen 是最后一次收到该客户端任何消息的时刻。
+	//
+	// 采访端走出 WiFi 覆盖范围时 TCP 要等很久才报错，readPump 期间连接
+	// 仍然是「已注册」状态。靠这个字段做超时判定，才能在不依赖 TCP 超时的
+	// 前提下把项目里的采访点标成离线。
+	LastSeen time.Time
+}
+
+// touch 刷新 LastSeen。读消息与扫描在两个 goroutine 上，必须加锁。
+func (c *Client) touch() {
+	c.mu.Lock()
+	c.LastSeen = time.Now()
+	c.mu.Unlock()
+}
+
+// lastSeen 取 LastSeen 的快照。
+func (c *Client) lastSeen() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.LastSeen
 }
 
 type Hub struct {
@@ -141,6 +184,15 @@ func (h *Hub) Run() {
 				})
 			}
 
+			// 采访端断开时立刻标离线。
+			//
+			// 这是最快的一条路径：客户端掉线的一瞬间就能让导播端变红，而
+			// 不必等 60 秒的后台扫描。扫描仍然保留，用于「TCP 还没断但人已经
+			// 走出覆盖范围」那种连接看似健在的情况。
+			if client.Role == "interviewer" && client.PointCode != "" {
+				markInterviewPointOffline(client.ProjectID, client.PointCode, "disconnect")
+			}
+
 		case message := <-h.broadcast:
 			h.mu.RLock()
 			for client := range h.clients {
@@ -156,6 +208,74 @@ func (h *Hub) Run() {
 
 // 连接速率限制：同一标识 1 秒内不允许重复连接
 var connectionRateLimit = make(map[string]time.Time)
+
+// isPrivilegedRole 判断连接角色是否属于必须持令牌的那几个。
+func isPrivilegedRole(role string) bool {
+	return role == "director" || role == "admin" || role == "super_admin"
+}
+
+// authenticateWS 解析并校验 WebSocket 携带的令牌。
+//
+// 与 HTTP 侧同一套规则：验签算法必须是 HMAC、必须查库确认用户还在、
+// 必须比对 token_version（改密码后旧令牌立即失效）。任何一条漏掉，
+// 「改密码即失效」在直播链路上就是漏的。
+func authenticateWS(token string) (models.User, error) {
+	if token == "" {
+		return models.User{}, fmt.Errorf("需要认证")
+	}
+	secret := facades.Config().GetString("jwt.secret")
+	if secret == "" {
+		return models.User{}, fmt.Errorf("JWT密钥未配置")
+	}
+	parsedToken, err := jwt.Parse(token, func(t *jwt.Token) (interface{}, error) {
+		// 必须检查算法。缺这一步的话，把 alg 改成 none 或非 HMAC 的令牌
+		// 可能被接受——另外两处验签点（中间件、resolveActor）都有这个检查。
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
+		return []byte(secret), nil
+	})
+	if err != nil || !parsedToken.Valid {
+		return models.User{}, fmt.Errorf("令牌无效")
+	}
+	claims, ok := parsedToken.Claims.(jwt.MapClaims)
+	if !ok {
+		return models.User{}, fmt.Errorf("令牌解析失败")
+	}
+	key, _ := claims["key"].(string)
+	uid, _ := strconv.ParseUint(key, 10, 64)
+	if uid == 0 {
+		return models.User{}, fmt.Errorf("无效的用户ID")
+	}
+
+	// ID == 0 的判断不能省：First 查不到时不报错，只把结构体留成零值。
+	var user models.User
+	if err := facades.Orm().Query().Select("id", "role", "token_version").
+		Where("id = ?", uid).First(&user); err != nil || user.ID == 0 {
+		return models.User{}, fmt.Errorf("用户不存在或已被删除")
+	}
+	claimVersion, _ := claims["ver"].(float64)
+	if int(claimVersion) != user.TokenVersion {
+		return models.User{}, fmt.Errorf("登录状态已失效，请重新登录")
+	}
+	return user, nil
+}
+
+// RequireProjectMembership 报告是否开启了项目成员校验。
+//
+// 默认关闭：用户表与项目授权关系在存量部署里可能还没配好，一上线就强制
+// 校验会让现场直接连不上。关闭时只记录不拦截（见 logMembershipMiss）。
+func RequireProjectMembership() bool {
+	return facades.Config().GetBool("authz.require_project_membership", false)
+}
+
+// IsProjectMember 判断用户是否被授权访问某个项目。
+//
+// 实现在 models 里，HTTP 侧的中间件用同一份——两处各写一遍 Count 查询迟早
+// 会出现「REST 放行、WS 拦下」这种只在一半路径上生效的漏洞。
+func IsProjectMember(userID, projectID uint) bool {
+	return models.IsProjectMember(userID, projectID)
+}
 
 func HandleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	projectID, _ := strconv.Atoi(r.URL.Query().Get("project_id"))
@@ -178,62 +298,53 @@ func HandleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		userID = uint(uid)
 	}
 
-	if role == "director" || role == "admin" || role == "super_admin" {
-		if token == "" {
-			http.Error(w, `{"error":"需要认证"}`, http.StatusUnauthorized)
-			return
-		}
-		// 手动解析 JWT，避免 Guard panic
-		secret := facades.Config().GetString("jwt.secret")
-		if secret == "" {
-			http.Error(w, `{"error":"JWT密钥未配置"}`, http.StatusInternalServerError)
-			return
-		}
-		parsedToken, err := jwt.Parse(token, func(t *jwt.Token) (interface{}, error) {
-			// 必须检查算法。缺这一步的话，把 alg 改成 none 或非 HMAC 的令牌
-			// 可能被接受——另外两处验签点（中间件、resolveActor）都有这个检查，
-			// 只有这里没有。
-			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+	privileged := isPrivilegedRole(role)
+	requireMembership := RequireProjectMembership()
+
+	var account models.User
+	hasAccount := false
+
+	// 令牌校验。导播/管理员一直要令牌；开启成员校验后所有角色都要。
+	// 二者都不满足但客户端仍然带了令牌时也验一次——验过就能识别身份，
+	// 对不上则只记日志放行，保持「关闭开关时不打断现有部署」的语义。
+	if privileged || requireMembership || token != "" {
+		user, err := authenticateWS(token)
+		if err != nil {
+			if privileged || requireMembership {
+				http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusUnauthorized)
+				return
 			}
-			return []byte(secret), nil
-		})
-		if err != nil || !parsedToken.Valid {
-			http.Error(w, `{"error":"令牌无效"}`, http.StatusUnauthorized)
-			return
+			log.Printf("[WS] role=%s 的令牌校验失败，项目成员校验未开启，按匿名连接放行: %v", role, err)
+		} else {
+			account = user
+			hasAccount = true
+			userID = user.ID
 		}
-		claims, ok := parsedToken.Claims.(jwt.MapClaims)
-		if !ok {
-			http.Error(w, `{"error":"令牌解析失败"}`, http.StatusUnauthorized)
-			return
-		}
-		key, _ := claims["key"].(string)
-		uid, _ := strconv.ParseUint(key, 10, 64)
-		if uid == 0 {
-			http.Error(w, `{"error":"无效的用户ID"}`, http.StatusUnauthorized)
-			return
-		}
-
-		// 校验令牌版本，与 HTTP 侧同一套规则：改密码后旧令牌的 WebSocket 连接
-		// 也必须连不上，否则「改密码即失效」在直播链路上是漏的。
-		var tokenUser models.User
-		if err := facades.Orm().Query().Select("id", "token_version").
-			Where("id = ?", uid).First(&tokenUser); err != nil || tokenUser.ID == 0 {
-			http.Error(w, `{"error":"用户不存在或已被删除"}`, http.StatusUnauthorized)
-			return
-		}
-		claimVersion, _ := claims["ver"].(float64)
-		if int(claimVersion) != tokenUser.TokenVersion {
-			http.Error(w, `{"error":"登录状态已失效，请重新登录"}`, http.StatusUnauthorized)
-			return
-		}
-
-		userID = uint(uid)
 	}
 
 	if projectID == 0 {
 		http.Error(w, `{"error":"需要 project_id 参数"}`, http.StatusBadRequest)
 		return
+	}
+
+	// 项目成员校验。
+	//
+	// 管理员及以上绕过：他们本来就要管理所有项目。其余角色（含导播）在严格
+	// 模式下必须是该项目的成员，否则 WS 就是一个绕过 REST 鉴权的后门——
+	// 只要知道 project_id 就能收到该项目的全部实时消息。
+	if requireMembership {
+		if !hasAccount {
+			http.Error(w, `{"error":"该项目需要登录后访问"}`, http.StatusUnauthorized)
+			return
+		}
+		if !models.Role(account.Role).AtLeast(models.RoleAdmin) &&
+			!IsProjectMember(userID, uint(projectID)) {
+			log.Printf("[WS] 用户 %d(%s) 不是项目 %d 的成员，拒绝连接", userID, account.Role, projectID)
+			http.Error(w, `{"error":"无权访问该项目"}`, http.StatusForbidden)
+			return
+		}
+	} else if !hasAccount && role != "interviewer" {
+		log.Printf("[WS] role=%s 未识别身份即连接 project=%d（项目成员校验未开启，仅记录）", role, projectID)
 	}
 
 	upgrader := websocket.Upgrader{
@@ -256,19 +367,15 @@ func HandleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		ProjectID: uint(projectID),
 		UserID:    userID,
 		Role:      role,
+		PointCode: pointCode,
 		Hub:       hub,
 		Send:      make(chan []byte, 256),
+		LastSeen:  time.Now(),
 	}
 
 	hub.register <- client
 
-	welcome := WSMessage{
-		Type:      "system",
-		ProjectID: uint(projectID),
-		Payload:   json.RawMessage(`{"message":"连接成功","online_count":` + strconv.Itoa(hub.GetProjectOnlineCount(uint(projectID))) + `}`),
-		Timestamp: time.Now().UnixMilli(),
-	}
-	data, _ := json.Marshal(welcome)
+	data, _ := json.Marshal(buildWelcome(hub, uint(projectID)))
 	client.Send <- data
 
 	// 导播连接时：如果没有锁，自动获取控制权
@@ -278,6 +385,117 @@ func HandleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 
 	go client.writePump()
 	go client.readPump()
+}
+
+// buildWelcome 拼出连接建立后的第一条 system 消息。
+//
+// 带上当前切台状态是这次改动的重点：客户端中途连上或断线重连时，
+// 不必等下一次切台就能显示正确的「正在播送 / 即将播送」，
+// 而不是停在「等待导播指令」。
+func buildWelcome(hub *Hub, projectID uint) WSMessage {
+	payload := WelcomePayload{
+		Message:     "连接成功",
+		OnlineCount: hub.GetProjectOnlineCount(projectID),
+	}
+
+	var state models.ProjectState
+	if err := facades.Orm().Query().Where("project_id = ?", projectID).
+		First(&state); err == nil && state.ProjectID != 0 {
+		payload.CurrentShot = state.CurrentShot
+		payload.NextShot = state.NextShot
+		// 只有真的有过切台才置位，否则客户端会把空机位名当成有效状态渲染。
+		payload.StateAvailable = state.CurrentShot != "" || state.NextShot != ""
+	}
+
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		// 序列化不可能失败（全是基本类型），真失败也不能拦下整条连接。
+		raw = json.RawMessage(`{"message":"连接成功"}`)
+	}
+
+	return WSMessage{
+		Type:      "system",
+		ProjectID: projectID,
+		Payload:   raw,
+		Timestamp: time.Now().UnixMilli(),
+	}
+}
+
+// loadProjectState 读取项目当前切台状态，没有记录时返回零值。
+func loadProjectState(projectID uint) models.ProjectState {
+	var state models.ProjectState
+	// ID == 0（这里是 ProjectID == 0）的判断不能省：First 查不到时不报错。
+	if err := facades.Orm().Query().Where("project_id = ?", projectID).
+		First(&state); err != nil || state.ProjectID == 0 {
+		return models.ProjectState{}
+	}
+	return state
+}
+
+// saveProjectState 落库项目当前切台状态。
+//
+// project_id 是主键，所以要自己判断「插入还是更新」——用 Count 明确判断，
+// 不能靠 First 的 error（SQLite 下查不到不报错，见 models/project.go 的说明）。
+func saveProjectState(projectID uint, current, next string) {
+	state := models.ProjectState{
+		ProjectID:   projectID,
+		CurrentShot: current,
+		NextShot:    next,
+		UpdatedAt:   time.Now(),
+	}
+
+	existing, err := facades.Orm().Query().Model(&models.ProjectState{}).
+		Where("project_id = ?", projectID).Count()
+	if err != nil {
+		log.Printf("[WS] 查询项目状态失败 project=%d: %v", projectID, err)
+		return
+	}
+	if existing == 0 {
+		if err := facades.Orm().Query().Create(&state); err != nil {
+			log.Printf("[WS] 写入项目状态失败 project=%d: %v", projectID, err)
+		}
+		return
+	}
+	if _, err := facades.Orm().Query().Model(&models.ProjectState{}).
+		Where("project_id = ?", projectID).Update(map[string]any{
+		"current_shot": current,
+		"next_shot":    next,
+		"updated_at":   state.UpdatedAt,
+	}); err != nil {
+		log.Printf("[WS] 更新项目状态失败 project=%d: %v", projectID, err)
+	}
+}
+
+// recordShotCut 记录一次真实的机位切换。
+//
+// 判定依据是「当前播送的机位发生了变化」，而不是「收到一条 shot_state」：
+// 导播先发预告（current 不变、next 有值）再发确认（current 变成 next），
+// 只有后者才是一次切台。把预告也记进去会把平均停留时长算成一半。
+func recordShotCut(projectID uint, from, to string, directorID uint) {
+	if to == "" || to == from {
+		return
+	}
+
+	mode := models.ProjectModeLive
+	var project models.Project
+	if err := facades.Orm().Query().Select("id", "mode").
+		Where("id = ?", projectID).First(&project); err == nil && project.ID != 0 {
+		if project.Mode != "" {
+			mode = project.Mode
+		}
+	}
+
+	cut := models.ShotCut{
+		ProjectID:  projectID,
+		FromShot:   from,
+		ToShot:     to,
+		DirectorID: directorID,
+		Mode:       mode,
+		CutAt:      time.Now(),
+	}
+	if err := facades.Orm().Query().Create(&cut); err != nil {
+		log.Printf("[WS] 记录切台失败 project=%d %s→%s: %v", projectID, from, to, err)
+	}
 }
 
 // autoAcquireLock 导播上线时自动获取控制权（如果当前无人持有）
@@ -377,6 +595,7 @@ func (c *Client) readPump() {
 	c.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	c.Conn.SetPongHandler(func(string) error {
 		c.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		c.touch()
 		return nil
 	})
 
@@ -385,6 +604,11 @@ func (c *Client) readPump() {
 		if err != nil {
 			break
 		}
+
+		// 任何一条消息都算「还活着」。心跳是最高频的那条，所以掉线判定
+		// 只要比心跳间隔大一点就够；同时它也覆盖了「采访端在不发心跳的
+		// 间隙里传了状态」这种情况。
+		c.touch()
 
 		var msg WSMessage
 		if err := json.Unmarshal(message, &msg); err != nil {
@@ -449,12 +673,36 @@ func (c *Client) readPump() {
 				sendSystemError(c, "你未持有控制权，无法切台")
 				continue
 			}
+
+			// 走到这里说明这次上报已经通过校验，是可以写进状态表与切台流水
+			// 的「真事件」。被上面两道守卫拒绝的上报只留在 messages 里当审计线索。
+			previous := loadProjectState(c.ProjectID)
+			saveProjectState(c.ProjectID, state.Current, state.Next)
+			recordShotCut(c.ProjectID, previous.CurrentShot, state.Current, c.UserID)
+
 			// 解说端与包装端各自维护「当前播送 / 即将切台」，直接吃这份状态。
 			c.Hub.SendToProjectRoles(c.ProjectID, []string{"commentator", "packaging"}, msg)
 
 		case "chat":
 			c.Hub.SendToProject(c.ProjectID, msg, nil)
 		case "interview_status":
+			// 采访状态必须先落库再广播。
+			//
+			// 之前这条分支只广播、不写 interview_status 表，于是导播端切回
+			// 某个项目时用 GET /api/interview/:id 拿到的是空列表，只能靠
+			// 后续 WS 广播慢慢补——「数据库仍是 ready」的说法其实是「数据库
+			// 里根本没有这条记录」。后台的掉线扫描也需要这行数据才能改状态。
+			var payload struct {
+				PointCode string `json:"point_code"`
+				PointName string `json:"point_name"`
+				Status    string `json:"status"`
+			}
+			if err := json.Unmarshal(msg.Payload, &payload); err != nil || payload.PointCode == "" {
+				log.Printf("[WS] interview_status 载荷非法 (project=%d): %v", c.ProjectID, err)
+				sendSystemError(c, "采访状态格式错误")
+				continue
+			}
+			PersistInterviewStatus(c.ProjectID, payload.PointCode, payload.PointName, payload.Status)
 			log.Printf("[WS] 采访状态变更: project=%d roles=director,packaging", c.ProjectID)
 			c.Hub.SendToProjectRoles(c.ProjectID, []string{"director", "packaging"}, msg)
 		default:
