@@ -54,7 +54,11 @@ func (c *AuditController) List(ctx http.Context) http.Response {
 	} else if fromRaw != "" {
 		return ctx.Response().Json(400, map[string]any{"error": "from 时间格式不正确"})
 	}
-	if to, ok := parseTimeFilter(toRaw); ok {
+	// to 走 parseTimeUpperBound 而不是 parseTimeFilter：管理后台把 to 默认成
+	// 「现在」，而 datetime-local 只能填到分钟。不补到那一分钟末尾的话，
+	// 刚刚写入的记录会因为 00:24:35 > 00:24:00 而查不到——审计页于是永远
+	// 看不到「刚刚做的事」。
+	if to, ok := parseTimeUpperBound(toRaw); ok {
 		query = query.Where("created_at <= ?", to)
 	} else if toRaw != "" {
 		return ctx.Response().Json(400, map[string]any{"error": "to 时间格式不正确"})

@@ -9,7 +9,7 @@ import (
 type StatusController struct{}
 
 // Version 当前后端版本号。会随发布手动同步，改动见 CHANGELOG。
-const Version = "1.4.0"
+const Version = "1.4.2"
 
 // MinClientVersion 是所有客户端都必须满足的最低适配版本。
 //
@@ -24,9 +24,20 @@ const Version = "1.4.0"
 //
 // 什么时候该动它：只有在引入了老客户端无法承受的后端改动时才上调，平时不动。
 //
-// 1.4.0 刻意没有上调：切台协议（shot_state）没变，欢迎消息新增的字段是附加的，
-// 项目成员校验默认关闭，新增接口也只是多出来的。老客户端连新后端一切照旧，
-// 所以它们看到的应该是琥珀色「建议更新」，而不是红色「必须更新」。
+// 1.4.2 刻意没有上调。这一版的改动逐条对过老客户端：
+//   - WS 广播新增 sender_name / sender_role：附加字段，老客户端不认也不受影响；
+//   - shot_state 现在也发给采访端：老采访端对非 system 的消息直接 return，
+//     收到也只是忽略；
+//   - /api/logs 新增 sender：附加字段；
+//   - /api/setup/status 在已初始化后不再下发部署细节：唯一读取方是随本版
+//     一起发布的管理后台，老缓存版本走到 needs_setup=false 分支也不会碰这些字段；
+//   - audit_logs.created_at 统一成 UTC：纯数据格式修正，不对外。
+//
+// 没有一条会让老客户端连上新后端出现功能异常，所以它们看到的应该是琥珀色
+// 「建议更新」，而不是红色「必须更新」。
+//
+// ⚠️ 唯一的行为变化是 ADMIN_MIN_ROLE：默认 logistics，导播账号不再能登录
+// 网页后台。原生导播端走的是 /api/auth/login，完全不受影响。
 const MinClientVersion = "1.3.0"
 
 func NewStatusController() *StatusController {

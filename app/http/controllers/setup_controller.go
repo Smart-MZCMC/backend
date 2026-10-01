@@ -16,9 +16,10 @@ import (
 
 // SetupController 提供「全新部署初始化向导」的两个接口。
 //
-// 这两个接口是公开的（向导页此时还没有任何账号可登录），能公开的前提是：
-// 只有在系统尚未初始化时才会真正执行写操作。一旦 users 表里有账号，
-// Apply 直接返回 403，Status 也只是如实汇报。
+// 这两个接口是公开的（向导页此时还没有任何账号可登录）。写操作 Apply
+// 自带「已初始化就 403」的守卫，读操作 Status 则在已初始化后整体停发部署细节
+// （理由见 Status 的注释）——只靠「Apply 会拒绝」来推断「Status 也不该多说」
+// 是错的：Status 在初始化之后依然可以被任何人匿名调用。
 //
 // 这和 POST /api/auth/register 的「引导模式」是同一类风险面，不额外放大：
 // 在第一个账号建好之前，能访问到端口的人本来就可以抢先注册管理员。
@@ -39,9 +40,23 @@ const (
 
 // Status 返回初始化向导需要的全部上下文。
 //
-// 全部是部署形态信息，不含任何账号数据；未初始化时本来就允许任何人调
-// Apply，所以这里也不构成额外泄露。
+// ⚠️ 这个接口是**公开**的（全新部署时系统里一个账号都没有，向导无从登录），
+//
+//	所以「公开」不能等于「一直公开同样的内容」。
+//
+// 下面这些字段——.env 与数据库的**绝对路径**、内网 IP、JWT_SECRET/APP_KEY
+// 是否已配置、是不是全新装的——对填表前的运维有用，对已初始化的系统毫无价值，
+// 却正好是一份匿名可读的部署情报：谁都能知道这台机器的文件怎么摆、密钥配了没有。
+// 因此 users 表里一有账号就整体停发，只保留判断「还需不需要初始化」所需的两个字段。
+// 前端拿到 needs_setup=false 就渲染「系统已完成初始化」，不依赖任何细节字段。
 func (c *SetupController) Status(ctx http.Context) http.Response {
+	if !setup.NeedsSetup() {
+		return ctx.Response().Json(200, map[string]any{
+			"needs_setup": false,
+			"version":     Version,
+		})
+	}
+
 	cfg := facades.Config()
 
 	port := strings.TrimSpace(cfg.GetString("http.port", "3000"))

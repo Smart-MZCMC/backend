@@ -52,6 +52,67 @@ func generateToken(user models.User) (string, error) {
 	return token.SignedString([]byte(secret))
 }
 
+// AdminMinRole 返回允许登录管理后台网页的最低角色等级。
+//
+// 配置项写错（比如填了一个不存在的角色名）时退回 logistics 并记日志：
+// 退回 0 会变成「谁都能进后台」，比默认拦掉导播危险得多。
+func AdminMinRole() models.Role {
+	raw := strings.TrimSpace(facades.Config().GetString("authz.admin_min_role", "logistics"))
+	role := models.Role(raw)
+	if !role.Valid() {
+		log.Printf("[AUTH] authz.admin_min_role=%q 不是合法角色，回退为 %s", raw, models.RoleLogistics)
+		return models.RoleLogistics
+	}
+	return role
+}
+
+// AdminLogin 是管理后台网页专用的登录入口。
+//
+// 与 Login 的唯一区别：登录成功后额外校验一次角色等级，够不到门槛的直接拒绝。
+// 之所以要单独一个接口而不是在 Login 里拦，是因为导播端/采访端/解说端这些
+// 原生应用共用 /api/auth/login——导播账号本就该能登录（它用原生界面），
+// 在那里按网页后台的门槛拦会把原生端一起打死。
+func (c *AuthController) AdminLogin(ctx http.Context) http.Response {
+	username := strings.TrimSpace(ctx.Request().Input("username", ""))
+	password := ctx.Request().Input("password", "")
+
+	if username == "" || password == "" {
+		return ctx.Response().Json(400, map[string]any{"error": "用户名和密码不能为空"})
+	}
+
+	var user models.User
+	if err := facades.Orm().Query().Where("username = ?", username).First(&user); err != nil || user.ID == 0 {
+		log.Printf("[AUTH] 用户不存在: %s", username)
+		return ctx.Response().Json(401, map[string]any{"error": "用户名或密码错误"})
+	}
+
+	if !facades.Hash().Check(password, user.Password) {
+		log.Printf("[AUTH] 密码错误: %s", username)
+		return ctx.Response().Json(401, map[string]any{"error": "用户名或密码错误"})
+	}
+
+	// 口令校验之后才判角色：先确认「这个人是谁」，再说「他能不能进后台」。
+	// 反过来会让人拿到一个「权限不足」的提示，从而确认该账号存在。
+	if min := AdminMinRole(); !models.Role(user.Role).AtLeast(min) {
+		log.Printf("[AUTH] %s(%s) 角色低于管理后台门槛 %s，拒绝网页登录", user.Username, user.Role, min)
+		return ctx.Response().Json(403, map[string]any{
+			"error": "该账号没有管理后台的访问权限（需要" + min.Label() + "及以上）。" +
+				"如需调整，可由管理员修改环境变量 ADMIN_MIN_ROLE。",
+		})
+	}
+
+	token, err := generateToken(user)
+	if err != nil {
+		log.Printf("[AUTH] 生成令牌失败: %v", err)
+		return ctx.Response().Json(500, map[string]any{"error": "生成令牌失败: " + err.Error()})
+	}
+
+	return ctx.Response().Json(200, map[string]any{
+		"token": token,
+		"user":  userPayload(user),
+	})
+}
+
 func (c *AuthController) Login(ctx http.Context) http.Response {
 	username := ctx.Request().Input("username", "")
 	password := ctx.Request().Input("password", "")

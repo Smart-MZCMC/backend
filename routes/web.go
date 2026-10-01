@@ -51,6 +51,9 @@ func Web() {
 	// === 认证路由（公开） ===
 	authController := controllers.NewAuthController()
 	facades.Route().Post("/api/auth/login", authController.Login)
+	// 管理后台网页专用的登录入口：与上面同一个校验流程，但额外要求角色达到
+	// authz.admin_min_role。原生客户端继续用 /api/auth/login，不受此限制。
+	facades.Route().Post("/api/auth/admin-login", authController.AdminLogin)
 	facades.Route().Post("/api/auth/register", authController.Register)
 	// 管理后台登录页据此在「登录」与「创建首个管理员」之间切换。
 	facades.Route().Get("/api/auth/bootstrap", authController.BootstrapStatus)

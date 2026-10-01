@@ -97,6 +97,38 @@ func isDateOnly(raw string) bool {
 	return len(raw) == len("2006-01-02")
 }
 
+// isMinutePrecision 报告时间参数是不是精确到分钟（没有秒）。
+func isMinutePrecision(raw string) bool {
+	return len(raw) == len("2006-01-02T15:04") ||
+		len(raw) == len("2006-01-02 15:04")
+}
+
+// parseTimeUpperBound 解析「结束时间」参数，并把低精度的取值补到末尾。
+//
+// 为什么要补：`datetime-local` 只能填到分钟，于是「2026-10-02T00:24」在服务端
+// 被解析成 00:24:00.000，`created_at <= 00:24:00` 会把 00:24:35 的记录挡掉。
+// 也就是说**用户指定的那一分钟里的记录全部查不到**，看起来就像刚做的操作没留痕。
+//
+// 管理后台的审计页把 to 默认成「现在」，所以这个偏差正好落在最要命的位置：
+// 刚改完角色立刻去看审计，最新的那条必定不显示。
+//
+// 补到末尾而不是原样保留，与已有的纯日期规则是同一条心思：「选到 2 月 1 日」
+// 期望的是包含 2 月 1 日整天，而不是从 2 月 1 日 00:00 之前开始。
+func parseTimeUpperBound(raw string) (time.Time, bool) {
+	t, ok := parseTimeFilter(raw)
+	if !ok {
+		return time.Time{}, false
+	}
+	switch {
+	case isDateOnly(raw):
+		return t.Add(24*time.Hour - time.Nanosecond), true
+	case isMinutePrecision(raw):
+		return t.Add(time.Minute - time.Nanosecond), true
+	default:
+		return t, true
+	}
+}
+
 // ListLogs 按条件分页查询协调日志。
 //
 // 这里同时修掉一个「界面对使用者撒谎」的问题：total 之前返回的是
@@ -136,13 +168,7 @@ func (c *MessageController) ListLogs(ctx http.Context) http.Response {
 	} else if fromRaw != "" {
 		return ctx.Response().Json(400, map[string]any{"error": "from 时间格式不正确"})
 	}
-	if to, ok := parseTimeFilter(toRaw); ok {
-		// 纯日期的 to 要算到当天结束，否则用户选到 2 月 1 日却拿不到当天的
-		// 记录，看起来像丢数据。带具体时刻的（含 datetime-local 的分钟精度）
-		// 不加，那是用户明确指定的截止点。
-		if isDateOnly(toRaw) {
-			to = to.Add(24*time.Hour - time.Nanosecond)
-		}
+	if to, ok := parseTimeUpperBound(toRaw); ok {
 		query = query.Where("created_at <= ?", to)
 	} else if toRaw != "" {
 		return ctx.Response().Json(400, map[string]any{"error": "to 时间格式不正确"})
@@ -166,8 +192,16 @@ func (c *MessageController) ListLogs(ctx http.Context) http.Response {
 		pageQuery = pageQuery.Where("id < ?", cursor)
 	}
 
+	// With("Sender") 把发送者一起带出来。
+	//
+	// 之前没预加载，于是 Message.Sender 恒为 nil，界面上「谁发的」这一列只能
+	// 拿 sender_id 顶着——而协调日志里发言的不止导播（解说、包装、采访都能发），
+	// 一堆数字编号没有任何可读性。
+	//
+	// 预加载不会泄露口令：models.User 的 Password 与 TokenVersion 都是 json:"-"。
+	// 用户名取 DisplayName 优先，与站内其他地方的显示口径保持一致。
 	var messages []models.Message
-	if err := pageQuery.OrderByDesc("id").Limit(limit).Find(&messages); err != nil {
+	if err := pageQuery.With("Sender").OrderByDesc("id").Limit(limit).Find(&messages); err != nil {
 		return ctx.Response().Json(500, map[string]any{"error": "查询日志失败"})
 	}
 

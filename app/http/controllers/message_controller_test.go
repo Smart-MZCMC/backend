@@ -132,4 +132,62 @@ func TestParseTimeFilter_EquivalentInstantsAgree(t *testing.T) {
 	}
 }
 
+// TestParseTimeUpperBound_IncludesWholeMinute 防的是「刚刚做的操作在审计页
+// 查不到」这一类问题。
+//
+// datetime-local 只能填到分钟，「2026-10-02T00:24」被解析成 00:24:00.000，
+// 而管理后台把 to 默认成「现在」。于是 `created_at <= 00:24:00` 会把
+// 00:24:35 写入的记录挡掉——最新那条必定不显示，看起来像根本没留痕。
+//
+// 判据用「同一分钟内的秒数」而不是具体时刻：只要 00:24:35 被包含即可。
+func TestParseTimeUpperBound_IncludesWholeMinute(t *testing.T) {
+	for _, raw := range []string{"2026-10-02T00:24", "2026-10-02 00:24"} {
+		bound, ok := parseTimeUpperBound(raw)
+		if !ok {
+			t.Fatalf("%q 应该能解析", raw)
+		}
+		// 该分钟内的最后一点必须落在上界之内（留 1ms 容差给纳秒截断）。
+		lateInMinute := time.Date(2026, 10, 2, 0, 24, 35, 0, time.Local).UTC()
+		if lateInMinute.After(bound) {
+			t.Errorf("%q 的上界 %v 把同分钟内的记录 %v 排除在外了",
+				raw, bound, lateInMinute)
+		}
+	}
+}
+
+// TestParseTimeUpperBound_DateOnlyCoversWholeDay 保留原有的纯日期语义：
+// 选到 2 月 1 日期望包含 2 月 1 日整天。
+func TestParseTimeUpperBound_DateOnlyCoversWholeDay(t *testing.T) {
+	bound, ok := parseTimeUpperBound("2026-05-20")
+	if !ok {
+		t.Fatal("纯日期应该能解析")
+	}
+	endOfDay := time.Date(2026, 5, 20, 23, 59, 59, 0, time.Local).UTC()
+	if endOfDay.After(bound) {
+		t.Fatalf("纯日期的上界 %v 应覆盖当天 23:59:59", bound)
+	}
+}
+
+// TestParseTimeUpperBound_SecondsPrecisionLeftAlone 保证带秒的取值仍是精确
+// 截止点——不能无脑补到分钟末尾，那会把用户明确排除的时间段又放回来。
+func TestParseTimeUpperBound_SecondsPrecisionLeftAlone(t *testing.T) {
+	bound, ok := parseTimeUpperBound("2026-05-20T09:30:15")
+	if !ok {
+		t.Fatal("带秒的时间应该能解析")
+	}
+	want := time.Date(2026, 5, 20, 9, 30, 15, 0, time.Local).UTC()
+	if !bound.Equal(want) {
+		t.Fatalf("带秒时不应扩展，得到 %v，期望 %v", bound, want)
+	}
+}
+
+// TestParseTimeUpperBound_InvalidStillRejected 保证错误信息那一条路没被改坏。
+func TestParseTimeUpperBound_InvalidStillRejected(t *testing.T) {
+	for _, raw := range []string{"", "昨天", "2026/10/02 00:24"} {
+		if _, ok := parseTimeUpperBound(raw); ok {
+			t.Errorf("%q 不该被当成合法时间", raw)
+		}
+	}
+}
+
 // TestParseTimeFilter_AcceptsOtherForms 保证其余几种写法没被顺手改坏。

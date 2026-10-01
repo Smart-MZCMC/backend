@@ -18,11 +18,22 @@ import (
 )
 
 type WSMessage struct {
-	Type      string          `json:"type"`
-	ProjectID uint            `json:"project_id"`
-	SenderID  uint            `json:"sender_id,omitempty"`
-	Payload   json.RawMessage `json:"payload"`
-	Timestamp int64           `json:"timestamp"`
+	Type      string `json:"type"`
+	ProjectID uint   `json:"project_id"`
+	SenderID  uint   `json:"sender_id,omitempty"`
+	// SenderName / SenderRole 由服务端在广播前盖上，不是客户端能填的字段。
+	//
+	// 为什么必须服务端盖：发送者身份要能区分「谁在说话」，而聊天里出现的
+	// 人不止导播（解说、包装、采访都能发言）。此前广播里只有 sender_id，
+	// 各端拿不到用户名，于是导播端把每条外来消息一律标成「其他」——
+	// 多端同场时等于没法沟通。
+	//
+	// 为什么不能从 payload 里取：payload 是客户端原样上传的内容，
+	// 采信它就等于允许任何人自称导播。
+	SenderName string          `json:"sender_name,omitempty"`
+	SenderRole string          `json:"sender_role,omitempty"`
+	Payload    json.RawMessage `json:"payload"`
+	Timestamp  int64           `json:"timestamp"`
 }
 
 // ShotStatePayload 切台状态载荷。
@@ -95,6 +106,9 @@ type Client struct {
 	ProjectID uint
 	UserID    uint
 	Role      string
+	// DisplayName 是握手时从令牌解析出来的账号名，广播时用作 sender_name。
+	// 匿名连接（未带令牌且成员校验关闭）时为空，接收端会退回按角色显示。
+	DisplayName string
 	// PointCode 只在采访端连接上非空（来自查询参数）。
 	// 没有它就无法回答「掉线的是哪个采访点」，后台扫描也就无从下手。
 	PointCode string
@@ -114,6 +128,50 @@ func (c *Client) touch() {
 	c.mu.Lock()
 	c.LastSeen = time.Now()
 	c.mu.Unlock()
+}
+
+// senderDisplayName 决定广播里显示的发送者名。
+//
+// 优先级：账号昵称 → 账号用户名 → 采访点名 → 角色名。
+// 落到角色名是必要的退路：关闭项目成员校验时采访端是匿名连接，
+// 昵称与用户名都取不到，若此时也返回空串，聊天里就会出现一排无名消息，
+// 现场根本分不清哪条是本机发的、哪条是别的采访点发的。
+func senderDisplayName(account models.User, hasAccount bool, role, pointCode string) string {
+	if hasAccount {
+		if account.DisplayName != "" {
+			return account.DisplayName
+		}
+		if account.Username != "" {
+			return account.Username
+		}
+	}
+	if role == "interviewer" && pointCode != "" {
+		return pointCode
+	}
+	return roleLabel(role)
+}
+
+// roleLabel 把 WS 角色标识翻成人能读的名字。
+//
+// 显示层不做这层翻译：它得在每个客户端各写一份，而角色词表是后端的概念，
+// 客户端写死一份迟早会漏掉新增的角色。
+func roleLabel(role string) string {
+	switch role {
+	case "director":
+		return "导播"
+	case "commentator":
+		return "解说"
+	case "packaging":
+		return "包装"
+	case "interviewer":
+		return "采访"
+	case "admin":
+		return "管理员"
+	case "super_admin":
+		return "超级管理员"
+	default:
+		return "未知"
+	}
 }
 
 // lastSeen 取 LastSeen 的快照。
@@ -362,16 +420,30 @@ func HandleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := &Client{
-		ID:        fmt.Sprintf("client-%d", time.Now().UnixNano()),
-		Conn:      conn,
-		ProjectID: uint(projectID),
-		UserID:    userID,
-		Role:      role,
-		PointCode: pointCode,
-		Hub:       hub,
-		Send:      make(chan []byte, 256),
-		LastSeen:  time.Now(),
+		ID:          fmt.Sprintf("client-%d", time.Now().UnixNano()),
+		Conn:        conn,
+		ProjectID:   uint(projectID),
+		UserID:      userID,
+		Role:        role,
+		DisplayName: senderDisplayName(account, hasAccount, role, pointCode),
+		PointCode:   pointCode,
+		Hub:         hub,
+		Send:        make(chan []byte, 256),
+		LastSeen:    time.Now(),
 	}
+
+	// 收到 pong 就刷新 LastSeen，掉线判定因此不再依赖应用层心跳。
+	//
+	// 采访端跑在浏览器里，后台标签页的 Timer.periodic 会被节流到分钟级，
+	// 于是 10 秒一次的应用层心跳实际上几分钟才发一条，而服务端 90 秒就判超时——
+	// 表现是导播端看到采访端「自己掉线了」，人其实一直好好开着页面。
+	//
+	// 协议层的 ping/pong 由浏览器网络栈应答，不经过 JS，也不受定时器节流影响，
+	// 所以它才是这类场景下唯一可靠的存活信号。writePump 每 30 秒发一次 ping。
+	conn.SetPongHandler(func(string) error {
+		client.touch()
+		return nil
+	})
 
 	hub.register <- client
 
@@ -617,6 +689,9 @@ func (c *Client) readPump() {
 
 		msg.ProjectID = c.ProjectID
 		msg.SenderID = c.UserID
+		// 发送者身份在这里盖章，而不是让客户端自己在 payload 里声明。
+		msg.SenderName = c.DisplayName
+		msg.SenderRole = c.Role
 		msg.Timestamp = time.Now().UnixMilli()
 
 		// --- 入库前先把「不算数」的消息挑掉 ---
@@ -681,7 +756,11 @@ func (c *Client) readPump() {
 			recordShotCut(c.ProjectID, previous.CurrentShot, state.Current, c.UserID)
 
 			// 解说端与包装端各自维护「当前播送 / 即将切台」，直接吃这份状态。
-			c.Hub.SendToProjectRoles(c.ProjectID, []string{"commentator", "packaging"}, msg)
+			//
+			// 采访端也在这份名单里：它在首页大字显示「正在采访 / 准备切台」，
+			// 名单里漏掉 interviewer 时它只能靠本地自己点状态按钮切页，
+			// 表现为「切台了但采访端没反应」。
+			c.Hub.SendToProjectRoles(c.ProjectID, []string{"commentator", "packaging", "interviewer"}, msg)
 
 		case "chat":
 			c.Hub.SendToProject(c.ProjectID, msg, nil)

@@ -61,7 +61,16 @@ func Write(ctx http.Context, actor models.User, record Record) {
 		TargetID:      record.TargetID,
 		Detail:        detail,
 		IP:            clientIP(ctx),
-		CreatedAt:     time.Now(),
+		// 必须显式转 UTC。time.Now() 带本地时区，GORM 会把偏移量一起写进
+		// 列里，于是这里存的是 `2026-10-02T00:13:19+08:00`，而其余靠
+		// GORM 自动时间戳的表存的是 `2026-10-01T16:13:19Z`。
+		//
+		// 混存的后果不是显示难看，而是**查不出来**：created_at 在 SQLite 里
+		// 是 TEXT，比较按字符串逐字符进行，而筛选条件经 parseTimeFilter 归一
+		// 成 UTC（`...16:14:00Z`）。`'2026-10-02T00:13:19+08:00' <=
+		// '2026-10-01T16:14:00Z'` 为假，于是任何带时间筛选的查询都返回 0 条，
+		// 而管理后台默认就带了「最近 7 天」——表现正是「明明有记录，审计页却是空的」。
+		CreatedAt: time.Now().UTC(),
 	}
 	if err := facades.Orm().Query().Create(&entry); err != nil {
 		log.Printf("[AUDIT] 审计记录写库失败 action=%s: %v", record.Action, err)
