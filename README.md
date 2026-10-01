@@ -192,14 +192,39 @@ curl -X POST http://localhost:3000/api/auth/register \
 
 | 方法 | 路径 | 说明 |
 | :--- | :--- | :--- |
-| `GET` | `/api/auth/profile` | 当前用户 |
-| `POST` | `/api/locks/:projectId/acquire` | 抢占控制权 || `POST` | `/api/locks/:projectId/release` | 释放控制权 |
+| `GET` `PUT` | `/api/auth/profile` | 读取 / 修改自己的资料 |
+| `PUT` | `/api/auth/password` | 改密码（旧令牌立即失效，响应带新令牌） |
+| `GET` | `/api/roles` | 角色清单（含中文名与等级） |
+| `POST` | `/api/locks/:projectId/acquire` | 抢占控制权 |
+| `POST` | `/api/locks/:projectId/release` | 释放控制权 |
 | `POST` | `/api/locks/:projectId/heartbeat` | 心跳续期 |
 | `GET` | `/api/locks/:projectId/status` | 控制权状态 |
 | `GET` | `/api/messages/:projectId` | 项目消息（最多 200 条） |
-| `GET` | `/api/logs` | 日志查询，支持 `project_id` `type` `limit` |
+| `GET` | `/api/logs` | 日志查询，支持 `project_id` `type` `sender_id` `from` `to` `limit` `cursor` |
 | `GET` | `/api/plugins` | 已注册插件列表 |
+| `GET` | `/api/projects` | 当前账号有权访问的项目 |
+| `GET` | `/api/projects/:projectId/cameras` | 机位预设 |
+| `GET` | `/api/projects/:projectId/shot-cuts` | 切台时间线与报表 |
 | `GET` | `/api/projects/:projectId/stats` | 项目统计 |
+
+> `/api/projects` 与 `/api/admin/projects` 不是一回事：前者给导播端用，只返回
+> 当前账号有权访问的项目；后者需要管理员角色。导播端曾经误用后者，项目下拉框
+> 恒为空——因为导播调它一律 403。
+
+`/api/logs` 返回的 `total` 是**匹配筛选条件的真实总行数**，与本页 `messages`
+的长度无关。翻页用 `next_cursor` 传回 `cursor`，不要用偏移量：日志表持续写入，
+偏移量分页会重复看到或整段跳过记录。
+
+### 需要 JWT + 项目成员身份
+
+带 `projectId` 的业务接口（`/api/locks/*`、`/api/messages/:id`、
+`/api/projects/:id/{cameras,shot-cuts,stats}`）与 WebSocket 握手都会校验调用者
+是不是该项目的成员，管理员及以上绕过。
+
+**这项校验由 `REQUIRE_PROJECT_MEMBERSHIP` 控制，默认 `false`**：关闭时只把
+「本来会被拦下的请求」写进日志而不拦截。存量部署未必给每个人都配过授权，
+直接打开会让现场当场连不上——打开前必须先把解说端 / 包装端 / 采访端的登录
+凭据配好（它们的 WebSocket 会在握手阶段被拒）。
 
 ### 需要 JWT + `admin` 角色
 
@@ -214,10 +239,16 @@ curl -X POST http://localhost:3000/api/auth/register \
 | `PUT` | `/api/admin/users/:id/role` | 修改角色 |
 | `GET` `POST` | `/api/admin/projects` | 项目列表 / 新建 |
 | `PUT` `DELETE` | `/api/admin/projects/:id` | 编辑 / 删除项目 |
+| `POST` `PUT` `DELETE` | `/api/admin/projects/:id/cameras[/:cameraId]` | 机位预设增删改 |
 | `POST` | `/api/admin/assign` `/api/admin/revoke` | 授权 / 撤销授权 |
 | `GET` | `/api/admin/users/:id/projects` | 某用户的授权列表 |
-| `POST` | `/api/logs/export` `/api/logs/export/csv` | 导出日志（只读接口保持登录即可） |
-| `POST` | `/api/logs/cleanup` | 清理超期日志 |
+| `GET` | `/api/admin/audit-logs` | 操作审计记录 |
+| `POST` | `/api/logs/export` `/api/logs/export/csv` | 导出日志（`from`/`to` 必填，上限 2 万行） |
+| `POST` | `/api/logs/cleanup` | 清理超期日志（本身也会写一条审计） |
+
+`PUT /api/admin/projects/:id` 的字段语义是「**出现了就更新**」，空串表示清空。
+不传某个字段表示不动它——不要用「值是否为空」来判断要不要发字段，否则描述
+一旦设过就再也清不掉。
 
 ## WebSocket 协议
 
@@ -236,10 +267,19 @@ curl -X POST http://localhost:3000/api/auth/register \
 - `shot_state` 是唯一的切台消息：`payload = {"current": "正在播送", "next": "即将切台"}`，
   `next` 为空串表示已确认切完。转发给解说端与包装端，需要持有控制权。
   旧的 `next_shot` / `confirm_switch` 已被合并，服务端只回一条 `system` 错误并丢弃。
+  通过校验的切台会更新 `project_states` 并在 `current` 真的变化时写一行 `shot_cuts`。
+- 连接建立后的第一条 `system` 消息带上项目当前的切台状态
+  （`current_shot` / `next_shot` / `state_available`）。没有它，中途连上来的
+  解说端与包装端会一直停在「等待导播指令」，直到下一次切台。
 - 客户端通过 `chat` 类型、`payload.message = "heartbeat"` 维持心跳。
   心跳在入库前就被丢弃：不写 `messages` 表、不计入项目消息统计、不转发给其他端。
-- `lock_update` 由服务端在抢占/释放/超时时广播
-- `interview_status` 变更会同时广播给导播端与包装端并写库
+  它唯一的用途是刷新服务端的 `LastSeen`，掉线扫描判断的就是它。
+- `lock_update` 由服务端在抢占/释放/超时时广播（`payload.reason` 为
+  `disconnect` 或 `timeout`）
+- `interview_status` 变更会**先写库再广播**给导播端与包装端。两件事都必须做：
+  只广播不落库的话，导播端切项目时拉到的是空列表。
+- 采访端断开、页面切后台或超时未上报时，服务端会把它置为 `offline` 并广播，
+  同时发一条 `interview_offline` 事件。超时扫描默认 60 秒一次、90 秒无消息即判定。
 
 ## 插件配置
 
@@ -250,9 +290,12 @@ curl -X POST http://localhost:3000/api/auth/register \
 | `NTFY_SERVER` / `NTFY_TOPIC` | 空 | ntfy 告警地址与主题，两者都填才启用 |
 | `PLUGIN_NTFY_ENABLED` | 空 | 显式开关；留空按配置是否齐全自动判断 |
 | `PLUGIN_LOG_ARCHIVE_ENABLED` | `true` | 是否启用日志归档 |
-| `PLUGIN_LOG_RETENTION_DAYS` | `30` | 日志保留天数 |
+| `PLUGIN_LOG_RETENTION_DAYS` | `30` | 日志保留天数，同时决定 `storage/exports` 的清理期限 |
 | `PLUGIN_LOG_CHECK_INTERVAL` | `1h` | 清理检查间隔，支持 `30s` / `5m` / `1h` |
+| `PLUGIN_PRESENCE_SCAN_INTERVAL` | `60s` | 采访端掉线扫描间隔 |
+| `PLUGIN_PRESENCE_TIMEOUT` | `90s` | 超过此时长没消息即判定采访端离线 |
 | `PLUGIN_CSV_EXPORT_ENABLED` | `true` | 是否启用日志导出接口 |
+| `REQUIRE_PROJECT_MEMBERSHIP` | `false` | 是否强制校验项目成员身份（见 `config/authz.go`） |
 
 `GET /api/plugins` 返回每个插件的 `name` / `version` / `description` / `enabled` / `reason` / `config`。
 `config` 里的机密值（如 ntfy topic）已做脱敏。停用的插件依然会出现在列表里，
@@ -264,6 +307,9 @@ curl -X POST http://localhost:3000/api/auth/register \
 
 - 抢占写入 `project_locks`，带 `expire_at`
 - 导播端周期性 `heartbeat` 续期，超时未续期则自动释放并广播通知
+- 过期锁由 `log-archive` 插件那个后台 goroutine 周期扫描清理，并发一条
+  `lock_timeout` 事件。在此之前锁只在「有人查询时」才会被顺手删掉，
+  没人查就永远不删，超时告警从未触发过。
 - 切换职责时由一方释放、另一方请求，状态实时同步
 
 ## 插件系统
@@ -273,8 +319,11 @@ curl -X POST http://localhost:3000/api/auth/register \
 | 插件 | 说明 |
 | :--- | :--- |
 | `ntfy-alert` | 通过 ntfy 推送到管理员手机。需配置 `server`/`topic`，未配置时自动禁用 |
-| `log-archive` | 按保留天数（默认 30 天）定期清理过期消息日志 |
+| `log-archive` | 按保留天数定期清理过期消息日志与导出文件；顺带跑采访端掉线扫描与控制权超时扫描 |
 | `csv-export` | 日志导出 |
+
+掉线扫描用回调注入（`SetPresenceScanner`）而不是让 `plugins` 反向 import
+`app/ws`：`ws` 已经 import 了 `plugins`（要发插件事件），反过来就成环了。
 
 ## 静态站点托管
 

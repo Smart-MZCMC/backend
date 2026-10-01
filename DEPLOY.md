@@ -5,12 +5,14 @@
 > **这些包从哪来？** GitHub Releases。给本仓库打 tag 即自动构建发布：
 >
 > ```sh
-> git tag v1.3.0
-> git push origin v1.3.0
+> git tag v1.4.0
+> git push origin v1.4.0
 > ```
 >
-> 工作流会构建后端发布包与两个客户端 APK，产出草稿 Release（**默认不直接发布**，
-> 需要人工确认后在 Releases 页面点 Publish）。详见本文末「发布流程」。
+> **先把四个客户端仓库的同名 tag 推上去，最后再推 backend 的**——工作流按同名
+> tag 拉取客户端源码，查不到就回退 `main`。详见本文末「发布流程」。
+>
+> 工作流会构建后端发布包与两个客户端 APK，产出 Release。
 >
 > 离线构建：`cd backend && go run ./tools` → `dist/backend-linux-amd64.tar.gz`。
 > 两者用的是同一个打包器，产物一致。
@@ -155,6 +157,48 @@ curl -X POST http://127.0.0.1:3000/api/auth/register \
 > 存量部署（数据库文件已存在且有账号）不会进入初始化模式，原来的
 > `cp .env.example .env` + `migrate` + `curl register` 流程照旧可用；
 > 后端只在启动时把 `.env` 里缺失的 `APP_KEY` / `JWT_SECRET` 补上，不改动已有值。
+
+### 升级到 1.4.0 后要做的事
+
+```sh
+./smart-mzcmc migrate      # 新增 5 个迁移，全部幂等，可重复执行
+```
+
+迁移会建 4 张新表（`shot_cuts` / `project_states` / `project_cameras` /
+`audit_logs`）、给 `projects` 加 6 列与 2 个索引，并给存量项目播下默认机位。
+不需要手工操作，也不会丢数据。
+
+建议顺手做的：
+
+1. 到管理后台「项目管理」页给各项目补上**日程**——导播端按它决定把哪一场置顶。
+2. 到新拆出来的「操作审计」Tab 看一眼，确认审计开始记录。
+3. **暂时不要打开 `REQUIRE_PROJECT_MEMBERSHIP`。** 它默认关闭、升级后不会
+   改变任何现有行为。要打开的话请看下一节，顺序不能反。
+
+### 项目授权校验（1.4.0 新增，默认关闭）
+
+`user_projects` 这张表此前只被管理后台读写，**从未参与任何权限判断**：后勤
+账号能看到全部项目，控制权接口只从 URL 取项目编号，WebSocket 只要知道
+`project_id` 就能监听整个项目的实时消息。
+
+打开开关会让下面这些位置校验成员身份（管理员及以上仍然绕过）：
+`/api/locks/*`、`/api/messages/:id`、`/api/projects/:id/*`，以及 WebSocket 握手。
+
+**打开的顺序不能反**，否则现场会当场断连：
+
+1. 在管理后台给每个使用者建账号，并在「权限分配」页把他们加到对应项目。
+2. 把账号密码填进各端配置：
+   - 解说端 / 包装端：exe 同目录 `config.json` 的 `Username` / `Password`
+   - 采访端：`public/interviewer/config.json` 的 `username` / `password`
+   - 导播端：本来就要登录，无需额外配置
+3. 各端重启（采访端刷新浏览器），确认都能正常连接。
+4. 把 `.env` 里的 `REQUIRE_PROJECT_MEMBERSHIP` 改成 `true`，重启后端。
+
+**关闭状态下后端不拦，但会记日志**，可以先拿它当名单看：
+
+```text
+[Authz] 用户 zhangsan(#7, logistics) 访问了未授权的项目 3（REQUIRE_PROJECT_MEMBERSHIP=false，仅记录，未拦截）
+```
 
 ### 角色与权限
 
@@ -386,8 +430,8 @@ systemd 单元里确认有 `Restart=always`（单元文件里已经带了）。
 打 tag 即触发 `.github/workflows/release.yml`：
 
 ```sh
-git tag v1.3.0
-git push origin v1.3.0
+git tag v1.4.0
+git push origin v1.4.0
 ```
 
 产物：
@@ -405,18 +449,24 @@ git push origin v1.3.0
 某个仓库没打这个 tag 时回退 `main`，并把实际用的 ref 写进 Release 说明。
 发布说明必须反映真实来源，不能装作可复现。
 
-想让发布完全可复现，就在五个仓库打同名 tag：
+想让发布完全可复现，就**先在四个客户端仓库打同名 tag，最后推 backend 的**：
 
 ```sh
 for r in admin docs director interviewer; do
-  git -C ../$r tag v1.3.0 && git -C ../$r push origin v1.3.0
+  git -C ../$r tag v1.4.0 && git -C ../$r push origin v1.4.0
 done
+# 最后这一步才触发流水线
+git tag v1.4.0 && git push origin v1.4.0
 ```
 
-### Release 是草稿
+> 顺序不能反。先推 backend 的话，这次发布的产物会是各客户端当时的 `main`，
+> 而不是你以为的那个版本。
 
-工作流用 `draft: true`，**不会自动发布**。请到 Releases 页面检查后手动点
-Publish。理由是 APK 和域名相关配置出错时后果比较直接，值得人工过一眼。
+### Release 是直接发布的
+
+工作流用 `draft: false`，构建完成后 Release 立即可见可下载。仓库本身是 public，
+所以产物（后端二进制与两个 APK）一旦发布就能被任何人下载。内网分发场景下如果
+希望先人工确认，把 `release.yml` 里的 `draft` 改回 `true` 即可。
 
 ### APK 签名
 

@@ -9,7 +9,7 @@ import (
 type StatusController struct{}
 
 // Version 当前后端版本号。会随发布手动同步，改动见 CHANGELOG。
-const Version = "1.3.0"
+const Version = "1.4.0"
 
 // MinClientVersion 是所有客户端都必须满足的最低适配版本。
 //
@@ -23,6 +23,10 @@ const Version = "1.3.0"
 //   - MinClientVersion <= 客户端 < Version：只是落后，软提示建议更新
 //
 // 什么时候该动它：只有在引入了老客户端无法承受的后端改动时才上调，平时不动。
+//
+// 1.4.0 刻意没有上调：切台协议（shot_state）没变，欢迎消息新增的字段是附加的，
+// 项目成员校验默认关闭，新增接口也只是多出来的。老客户端连新后端一切照旧，
+// 所以它们看到的应该是琥珀色「建议更新」，而不是红色「必须更新」。
 const MinClientVersion = "1.3.0"
 
 func NewStatusController() *StatusController {
