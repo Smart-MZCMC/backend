@@ -17,12 +17,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -35,6 +37,13 @@ type Config struct {
 	AllowReplace bool
 	Token        string
 	Timeout      time.Duration
+
+	// DownloadMirror 是资产下载镜像的前缀。为空表示直接从 GitHub 下载。
+	//
+	// 只影响**下载地址**，不影响校验：sha256 比对照旧要做，而且必须做。
+	// 引入第三方镜像因此不会削弱完整性保证——镜像返回一个 HTML 错误页
+	// 或旧版本，都会在 verifyChecksum 那里被挡住。
+	DownloadMirror string
 }
 
 func (c Config) apiBase() string {
@@ -42,6 +51,19 @@ func (c Config) apiBase() string {
 		return strings.TrimRight(c.Server, "/")
 	}
 	return "https://api.github.com"
+}
+
+// assetURL 返回资产的实际下载地址。
+//
+// 镜像按「把原始 URL 整体套进前缀」处理，而不是替换域名。原因是各镜像服务
+// 的 URL 结构差异很大：`https://ghfast.top/https://github.com/...`、
+// `https://gh-proxy.com/https://github.com/...`、自建的 `/github-proxy/…`
+// 各不相同，一个前缀配置能覆盖全部，换成「填域名」就得为每种镜像写一套模板。
+func (c Config) assetURL(raw string) string {
+	if c.DownloadMirror == "" {
+		return raw
+	}
+	return strings.TrimRight(c.DownloadMirror, "/") + "/" + raw
 }
 
 // release 是 GitHub release payload 里我们用得到的字段。
@@ -91,6 +113,137 @@ type ApplyResult struct {
 	StagedPath string   `json:"staged_path,omitempty"`
 	Steps      []string `json:"steps"`
 	Restart    string   `json:"restart_hint,omitempty"`
+}
+
+// Progress 是一次更新任务的实时进度。
+//
+// 为什么要单独一个结构而不是靠日志：更新要下载 26 MB 的包，在校园网里可能
+// 要几分钟。原来整个下载/校验/解压/替换都在一个 HTTP 请求里同步跑完，
+// 界面上只能显示「更新中…」和一个不动的按钮——用户既不知道卡在哪一步，
+// 也不知道是在下载还是在解压，最后只能刷新页面看看服务活着没有。
+type Progress struct {
+	// Stage 是机器可读的阶段标识，前端据此决定进度条的形态
+	// （下载阶段看百分比，其余阶段看阶段名）。
+	Stage string `json:"stage"`
+	// Message 是给运维看的一句话，与 Steps 里累积的日志并行存在。
+	Message string `json:"message,omitempty"`
+	// Done / Total 是已处理与总量。下载阶段是字节数，其余阶段 Total 为 0。
+	Done    int64   `json:"done"`
+	Total   int64   `json:"total"`
+	Percent float64 `json:"percent"`
+	// Steps 是按时间顺序累积的执行日志，与 ApplyResult.Steps 同源。
+	Steps []string `json:"steps,omitempty"`
+	// Finished / Failed 是终态标志。二者之一为 true 时前端应停止轮询。
+	Finished bool   `json:"finished"`
+	Failed   bool   `json:"failed"`
+	Error    string `json:"error,omitempty"`
+	// Result 在 Finished 且未 Failed 时有值，内容与旧的同步返回值一致。
+	Result *ApplyResult `json:"result,omitempty"`
+	// StartedAt / UpdatedAt 供前端判断「多久没动静了」。
+	StartedAt time.Time `json:"started_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// 阶段标识。取值写成常量而不是散落的字面量：前端要按阶段分支，
+// 两边各写一份字符串迟早对不上。
+const (
+	StageIdle        = "idle"
+	StageFetching    = "fetching"
+	StageDownloading = "downloading"
+	StageVerifying   = "verifying"
+	StageExtracting  = "extracting"
+	StageReplacing   = "replacing"
+	StageMigrating   = "migrating"
+	StageFinished    = "finished"
+	StageFailed      = "failed"
+)
+
+// 进度状态。Apply 在后台 goroutine 里跑，而查询进度是另一个请求，
+// 所以状态必须是包级的。整套在线更新同时只允许一个任务（见 Start）。
+var (
+	progressMu sync.RWMutex
+	progress   Progress
+)
+
+// CurrentProgress 返回最近一次更新的进度。
+//
+// 没有任务在跑时返回 Stage=idle 的空进度，而不是 404——
+// 「还没开始更新」是正常状态，前端据此显示空面板。
+func CurrentProgress() Progress {
+	progressMu.RLock()
+	defer progressMu.RUnlock()
+	if progress.Stage == "" {
+		return Progress{Stage: StageIdle}
+	}
+	return progress
+}
+
+// beginProgress 清空并写入一次新任务的初始状态。
+func beginProgress() {
+	progressMu.Lock()
+	defer progressMu.Unlock()
+	now := time.Now()
+	progress = Progress{
+		Stage:     StageFetching,
+		Message:   "正在查询更新源…",
+		StartedAt: now,
+		UpdatedAt: now,
+	}
+}
+
+// BeginProgress 由控制器在启动任务前调用，重置上一轮遗留的状态。
+func BeginProgress() { beginProgress() }
+
+// FinishProgress 标记任务成功结束。
+func FinishProgress(res *ApplyResult) {
+	recordProgress(func(p *Progress) {
+		p.Stage = StageFinished
+		p.Finished = true
+		p.Failed = false
+		p.Error = ""
+		p.Message = "更新完成"
+		p.Percent = 100
+		if res != nil {
+			p.Result = res
+			// 阶段消息比通用的「更新完成」有用：替换成功意味着马上要重启，
+			// 没开启替换则意味着还要手工操作，两者的下一步完全不同。
+			if res.Replaced {
+				p.Message = "更新完成，服务即将重启"
+			} else {
+				p.Message = "已下载并校验，等待手工替换"
+			}
+		}
+	})
+}
+
+// FailProgress 标记任务失败，并把原因写进进度。
+//
+// 失败信息必须走进度而不是只返回给发起请求的那一次调用：请求早已返回
+// 「已启动」，之后的失败只有轮询才看得到。
+func FailProgress(msg string) {
+	recordProgress(func(p *Progress) {
+		p.Stage = StageFailed
+		p.Failed = true
+		p.Finished = true
+		p.Error = msg
+		p.Message = "更新失败"
+	})
+}
+
+// recordProgress 更新进度。fn 收到的是当前快照的副本，改完再写回，
+// 避免调用方在闭包里意外把别的字段一起覆盖。
+func recordProgress(fn func(p *Progress)) {
+	progressMu.Lock()
+	defer progressMu.Unlock()
+	p := progress
+	fn(&p)
+	p.UpdatedAt = time.Now()
+	progress = p
+}
+
+// appendStep 往累积日志里追加一行。
+func appendStep(msg string) {
+	recordProgress(func(p *Progress) { p.Steps = append(p.Steps, msg) })
 }
 
 type Updater struct {
@@ -182,12 +335,20 @@ func (u *Updater) fetchLatest() (*release, error) {
 	return &rel, nil
 }
 
-// Apply 下载并校验新版本。
+// Apply 下载并校验新版本，不报告进度。
 //
-// current 必须是当前运行的版本号；传空串表示不做「是否更新」的判断，
-// 直接下载 latest。allowTarget 非空时只接受该版本，防止「检查时看到的是
-// v1.2.0，下载时变成了 v1.3.0」这种竞态——版本必须由人确认过。
+// 等价于 ApplyWithProgress(..., nil)。保留这个薄封装是因为「只想拿结果」
+// 的调用方（例如将来的命令行工具）不该被一个回调参数绑住。
 func (u *Updater) Apply(current, allowTarget, binaryName string) (*ApplyResult, error) {
+	return u.ApplyWithProgress(current, allowTarget, binaryName, nil)
+}
+
+// ApplyWithProgress 下载并校验新版本，并通过 progress 回调实时报告进度。
+//
+// progress 可以为 nil（此时不做任何额外工作）。非 nil 时它会被并发调用：
+// 更新在后台 goroutine 里跑，查询进度是另一个请求，两者共享这份状态。
+// 所以回调内部必须只做「记一份快照」这种轻活，绝不能阻塞。
+func (u *Updater) ApplyWithProgress(current, allowTarget, binaryName string, progress func(Progress)) (*ApplyResult, error) {
 	if !u.cfg.Enabled {
 		return nil, errors.New("在线更新未启用（需设置 UPDATE_ENABLED=true）")
 	}
@@ -197,8 +358,21 @@ func (u *Updater) Apply(current, allowTarget, binaryName string) (*ApplyResult, 
 		msg := fmt.Sprintf(format, a...)
 		steps = append(steps, msg)
 		u.log("%s", msg)
+		appendStep(msg)
+	}
+	// stage 切阶段时补一条进度。下载阶段由字节回调单独驱动，
+	// 不在这里覆盖它的 Done/Total。
+	stage := func(name, format string, a ...any) {
+		msg := fmt.Sprintf(format, a...)
+		recordProgress(func(p *Progress) {
+			p.Stage = name
+			p.Message = msg
+			// 进入新阶段时把百分比清零，避免上一阶段的数字被误读成当前进度。
+			p.Done, p.Total, p.Percent = 0, 0, 0
+		})
 	}
 
+	stage(StageFetching, "正在查询更新源…")
 	rel, err := u.fetchLatest()
 	if err != nil {
 		return nil, err
@@ -225,7 +399,20 @@ func (u *Updater) Apply(current, allowTarget, binaryName string) (*ApplyResult, 
 	archivePath := filepath.Join(dir, u.cfg.Asset)
 
 	// 1. 下载发布包
-	if err := u.download(asset.BrowserDownloadURL, archivePath); err != nil {
+	stage(StageDownloading, "正在下载 %s", u.cfg.Asset)
+	downloadURL := u.cfg.assetURL(asset.BrowserDownloadURL)
+	if u.cfg.DownloadMirror != "" {
+		step("下载地址经镜像：%s", u.cfg.DownloadMirror)
+	}
+	if err := u.download(downloadURL, archivePath, asset.Size, func(done int64) {
+		recordProgress(func(p *Progress) {
+			p.Stage = StageDownloading
+			p.Done = done
+			p.Total = asset.Size
+			p.Percent = percentOf(done, asset.Size)
+			p.Message = "正在下载 " + humanBytes(done) + " / " + humanBytes(asset.Size)
+		})
+	}); err != nil {
 		return nil, fmt.Errorf("下载失败: %w", err)
 	}
 	info, _ := os.Stat(archivePath)
@@ -236,6 +423,7 @@ func (u *Updater) Apply(current, allowTarget, binaryName string) (*ApplyResult, 
 	step("已下载 %.1f MB", float64(size)/(1<<20))
 
 	// 2. 校验和
+	stage(StageVerifying, "正在校验 sha256…")
 	sum, err := fileSHA256FromFile(archivePath)
 	if err != nil {
 		return nil, err
@@ -250,6 +438,7 @@ func (u *Updater) Apply(current, allowTarget, binaryName string) (*ApplyResult, 
 	step("sha256 校验通过 %s", sum[:16])
 
 	// 3. 解出可执行文件
+	stage(StageExtracting, "正在解压可执行文件…")
 	staged := filepath.Join(dir, binaryName+".new")
 	if err := extractBinary(archivePath, binaryName, staged); err != nil {
 		return nil, fmt.Errorf("解压失败: %w", err)
@@ -273,10 +462,15 @@ func (u *Updater) Apply(current, allowTarget, binaryName string) (*ApplyResult, 
 
 	if !u.cfg.AllowReplace {
 		res.Restart = "UPDATE_ALLOW_REPLACE 未开启，新版本已就绪但未替换当前程序；确认无误后可手工替换并重启。"
+		// 这里刻意不设 StageFinished：终态（含 Finished/Failed 标志）由调用方
+		// 通过 FinishProgress / FailProgress 落。混着设会造出
+		//「stage=finished 但 finished=false」这种自相矛盾的进度，前端无从判断该不该停轮询。
+		step("新版本已就绪，未替换当前程序")
 		return res, nil
 	}
 
 	// 4. 备份并替换
+	stage(StageReplacing, "正在备份并替换当前程序…")
 	live, err := os.Executable()
 	if err != nil {
 		return nil, err
@@ -305,6 +499,7 @@ func (u *Updater) Apply(current, allowTarget, binaryName string) (*ApplyResult, 
 
 	// 5. 先跑迁移再退出。迁移失败就把备份换回去——否则进程一退出，
 	// systemd 拉起一个起不来的版本，故障就从「更新失败」变成「服务不可用」。
+	stage(StageMigrating, "正在执行数据库迁移…")
 	if err := u.runMigrate(live); err != nil {
 		copyFile(backup, live, 0o755)
 		return nil, fmt.Errorf("新版本数据库迁移失败，已回滚到备份版本，请检查迁移日志: %w", err)
@@ -313,6 +508,7 @@ func (u *Updater) Apply(current, allowTarget, binaryName string) (*ApplyResult, 
 	step("数据库迁移成功")
 
 	res.Restart = "本进程即将退出，请由 systemd 自动拉起新版本。"
+	step("更新完成，服务即将重启")
 	return res, nil
 }
 
@@ -331,7 +527,14 @@ func (u *Updater) runMigrate(binary string) error {
 	return nil
 }
 
-func (u *Updater) download(url, dest string) error {
+// download 下载一个文件，过程中按字节回调进度。
+//
+// total 来自 Release 里的 size 字段，只用于显示百分比；传 0 也能正常工作，
+// 此时回调仍然报告已下载字节数，由调用方自己决定怎么呈现。
+//
+// onProgress 可能被调用很多次（每个 Write 一次），所以它必须很轻——
+// 调用方的节流放在自己那一层。
+func (u *Updater) download(url, dest string, total int64, onProgress func(int64)) error {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return err
@@ -350,7 +553,8 @@ func (u *Updater) download(url, dest string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(f, io.LimitReader(resp.Body, maxArtifactBytes)); err != nil {
+	w := &progressWriter{w: f, onProgress: onProgress}
+	if _, err := io.Copy(w, io.LimitReader(resp.Body, maxArtifactBytes)); err != nil {
 		f.Close()
 		os.Remove(tmp)
 		return err
@@ -362,12 +566,58 @@ func (u *Updater) download(url, dest string) error {
 	return os.Rename(tmp, dest)
 }
 
+// progressWriter 在写入过程中累加字节数并回调。
+type progressWriter struct {
+	w          io.Writer
+	done       int64
+	onProgress func(int64)
+}
+
+func (p *progressWriter) Write(b []byte) (int, error) {
+	n, err := p.w.Write(b)
+	if n > 0 {
+		p.done += int64(n)
+		if p.onProgress != nil {
+			p.onProgress(p.done)
+		}
+	}
+	return n, err
+}
+
+// percentOf 返回百分比，取值 0..100。total 未知（<=0）时返回 0——
+// 显示一个凭空猜的百分比比不显示更糟。
+func percentOf(done, total int64) float64 {
+	if total <= 0 {
+		return 0
+	}
+	p := float64(done) / float64(total) * 100
+	if p > 100 {
+		p = 100
+	}
+	if p < 0 {
+		p = 0
+	}
+	return math.Round(p*10) / 10
+}
+
+// humanBytes 把字节数写成「12.3 MB」这种形式。
+func humanBytes(n int64) string {
+	const unit = 1 << 20
+	if n < unit {
+		return fmt.Sprintf("%d KB", n/(1<<10))
+	}
+	return fmt.Sprintf("%.1f MB", float64(n)/unit)
+}
+
 func (u *Updater) fetchAsset(rel *release, name string) ([]byte, error) {
 	asset := findAsset(rel, name)
 	if asset == nil {
 		return nil, fmt.Errorf("发布包 %s 里没有 %s", rel.TagName, name)
 	}
-	req, err := http.NewRequest(http.MethodGet, asset.BrowserDownloadURL, nil)
+	// 同样经镜像取。checksums.txt 是**安全判据的来源**，所以它走不走镜像
+	// 都必须能拿到——拿不到就整体拒绝执行（见 Apply 里那句「拒绝在无法校验
+	// 的情况下继续」），不会因为镜像不可用而悄悄跳过校验。
+	req, err := http.NewRequest(http.MethodGet, u.cfg.assetURL(asset.BrowserDownloadURL), nil)
 	if err != nil {
 		return nil, err
 	}

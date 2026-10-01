@@ -257,3 +257,187 @@ func TestElfFingerprint_RejectsNonELF(t *testing.T) {
 		t.Fatalf("架构应为 amd64，实际 %q", arch)
 	}
 }
+
+// 镜像前缀：这是「能查到有新版、但一点更新就卡住」的唯一解药，
+// 而配错形态（写成域名而不是前缀、或多一个/）是最容易犯的错。
+func TestConfigAssetURL(t *testing.T) {
+	const raw = "https://github.com/Smart-MZCMC/backend/releases/download/v1.4.2/backend-linux-amd64.tar.gz"
+
+	cases := []struct {
+		name   string
+		mirror string
+		want   string
+	}{
+		{
+			name:   "未配镜像时原样返回",
+			mirror: "",
+			want:   raw,
+		},
+		{
+			name:   "前缀包裹原始 URL",
+			mirror: "https://ghfast.top/",
+			want:   "https://ghfast.top/" + raw,
+		},
+		{
+			// 末尾多个斜杠不应该拼出 "//https://" —— 有些代理会因此 404。
+			name:   "前缀末尾多余的斜杠要被去掉",
+			mirror: "http://192.168.1.10/github-proxy///",
+			want:   "http://192.168.1.10/github-proxy/" + raw,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := Config{DownloadMirror: c.mirror}.assetURL(raw)
+			if got != c.want {
+				t.Fatalf("得到 %q，期望 %q", got, c.want)
+			}
+		})
+	}
+}
+
+// 镜像不改变原始 URL 的可追溯性：拼接必须是纯粹的「前缀 + 原串」，
+// 不能把 host 换掉——否则 sha256 之外的排查手段（看 URL 就知道来自哪儿）就没了。
+func TestConfigAssetURL_KeepsOriginalPath(t *testing.T) {
+	cfg := Config{DownloadMirror: "https://mirror.test"}
+	got := cfg.assetURL("https://github.com/o/r/releases/download/v1/a.tgz")
+	if !strings.HasSuffix(got, "/o/r/releases/download/v1/a.tgz") {
+		t.Fatalf("原始路径被改动了: %s", got)
+	}
+	if !strings.HasPrefix(got, "https://mirror.test/") {
+		t.Fatalf("镜像前缀没生效: %s", got)
+	}
+}
+
+// percentOf：进度条的百分比。total 未知时必须返回 0 而不是猜一个。
+func TestPercentOf(t *testing.T) {
+	cases := []struct {
+		done, total int64
+		want        float64
+	}{
+		{0, 100, 0},
+		{50, 100, 50},
+		{100, 100, 100},
+		{1, 3, 33.3},
+		// 少一个字节不该显示 100%——那会让人以为下完了。
+		{999, 1000, 99.9},
+		// total 未知（镜像没给 Content-Length）时不给百分比。
+		{12345, 0, 0},
+		{12345, -1, 0},
+	}
+	for _, c := range cases {
+		if got := percentOf(c.done, c.total); got != c.want {
+			t.Errorf("percentOf(%d, %d) = %v，期望 %v", c.done, c.total, got, c.want)
+		}
+	}
+}
+
+// 进度字节数单调不减，且最后一次等于总字节数。
+//
+// 单调性是进度条不往回跳的前提；末值相等才说明「确实下完了」而不是
+// 「中途断了但看起来像完成」。
+func TestProgressWriter_ReportsMonotonicBytes(t *testing.T) {
+	var buf bytes.Buffer
+	var seen []int64
+	w := &progressWriter{w: &buf, onProgress: func(done int64) { seen = append(seen, done) }}
+
+	payload := []byte("0123456789")
+	if _, err := w.Write(payload[:4]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(payload[4:]); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(seen) != 2 {
+		t.Fatalf("每次 Write 都应回调一次，实际 %d 次: %v", len(seen), seen)
+	}
+	if seen[0] != 4 || seen[1] != 10 {
+		t.Fatalf("回调的字节数不对: %v", seen)
+	}
+	if seen[0] >= seen[1] {
+		t.Fatalf("字节数必须单调递增: %v", seen)
+	}
+	if buf.String() != string(payload) {
+		t.Fatalf("数据没原样写下去: %q", buf.String())
+	}
+}
+
+// 没有回调时 progressWriter 也要正常工作（Apply 这条路径不报告进度）。
+func TestProgressWriter_WorksWithoutCallback(t *testing.T) {
+	var buf bytes.Buffer
+	w := &progressWriter{w: &buf}
+	if _, err := w.Write([]byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	if buf.String() != "abc" {
+		t.Fatalf("数据没写下去: %q", buf.String())
+	}
+}
+
+// humanBytes：进度文案里那个「12.3 MB」。
+func TestHumanBytes(t *testing.T) {
+	cases := []struct {
+		n    int64
+		want string
+	}{
+		{512 * 1024, "512 KB"},
+		{1024 * 1024, "1.0 MB"},
+		{26623000, "25.4 MB"},
+	}
+	for _, c := range cases {
+		if got := humanBytes(c.n); got != c.want {
+			t.Errorf("humanBytes(%d) = %q，期望 %q", c.n, got, c.want)
+		}
+	}
+}
+
+// 终态必须同时把 Finished 与 Failed 置成明确值。
+//
+// 前端是靠 Finished 决定停不停轮询的；一旦出现「stage 像是成功了但 finished=false」
+// 这种自相矛盾的状态，界面就会一直转圈。
+func TestFinishAndFailProgress_SetTerminalFlags(t *testing.T) {
+	BeginProgress()
+
+	FailProgress("下载失败")
+	got := CurrentProgress()
+	if !got.Finished || !got.Failed {
+		t.Fatalf("失败态应为 Finished+Failed，实际 %+v", got)
+	}
+	if got.Stage != StageFailed || got.Error == "" {
+		t.Fatalf("失败态应带 stage 与原因: %+v", got)
+	}
+
+	FinishProgress(&ApplyResult{Version: "1.4.4", Replaced: true})
+	got = CurrentProgress()
+	if !got.Finished || got.Failed {
+		t.Fatalf("成功态应为 Finished 且非 Failed，实际 %+v", got)
+	}
+	if got.Stage != StageFinished || got.Percent != 100 {
+		t.Fatalf("成功态应为 stage=finished 且 100%%: %+v", got)
+	}
+	if got.Result == nil || got.Result.Version != "1.4.4" {
+		t.Fatalf("成功态应带上结果: %+v", got)
+	}
+	// 替换成功意味着马上重启，提示必须说清楚下一步，否则用户会以为卡住了。
+	if !strings.Contains(got.Message, "重启") {
+		t.Fatalf("替换成功的提示应提到重启: %q", got.Message)
+	}
+}
+
+// 新一轮任务必须清掉上一轮的残留，尤其是 Failed 与 Steps。
+//
+// 不清的话，界面上会同时显示上一轮的失败原因和这一轮的进度——
+// 「更新失败」和「正在下载」并排出现，没法判断到底哪一次出的问题。
+func TestBeginProgress_ResetsPreviousRun(t *testing.T) {
+	BeginProgress()
+	FailProgress("上一轮的失败")
+	BeginProgress()
+
+	got := CurrentProgress()
+	if got.Failed || got.Finished || got.Error != "" {
+		t.Fatalf("新一轮不该带着上一轮的失败态: %+v", got)
+	}
+	if len(got.Steps) != 0 {
+		t.Fatalf("新一轮不该带着上一轮的日志: %v", got.Steps)
+	}
+}

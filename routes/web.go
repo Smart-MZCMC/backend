@@ -113,6 +113,8 @@ func Web() {
 		r.Prefix("/api/system").Middleware(middleware.RequireRole(models.RoleSuperAdmin)).Group(func(sr route.Router) {
 			sr.Get("/info", systemController.Info)
 			sr.Get("/update", systemController.UpdateStatus)
+			// 进度查询。更新跑在后台 goroutine 里，这个接口是它唯一的观察窗口。
+			sr.Get("/update/progress", systemController.UpdateProgress)
 			sr.Post("/update/apply", systemController.ApplyUpdate)
 		})
 
