@@ -158,8 +158,12 @@ jobs:
           channel: stable
           cache: true
 
+      # VITE_APP_VERSION 由客户端用来和后端版本比对，不一致时在界面上提示。
+      # Vite 会自动把 VITE_* 开头的环境变量暴露给 import.meta.env，无需改配置。
       - name: Build admin
         working-directory: admin
+        env:
+          VITE_APP_VERSION: ${{ steps.ver.outputs.version }}
         run: |
           pnpm install
           pnpm run build
@@ -177,7 +181,10 @@ jobs:
         run: |
           flutter --version
           flutter pub get
-          flutter build web --release --base-href /interviewer/ --no-web-resources-cdn
+          # --dart-define 把权威版本号编译进产物。客户端靠它和后端比对，
+          # 所以必须是构建时注入，不能从 pubspec.yaml 运行时读（那样普通构建
+          # 会得到空值，误报成「版本不一致」）。
+          flutter build web --release --base-href /interviewer/ --no-web-resources-cdn             --dart-define=APP_VERSION=${{ steps.ver.outputs.version }}
           node trim-web.mjs build/web
 
       - name: Copy static sites into public/
@@ -263,6 +270,7 @@ jobs:
         working-directory: director
         env:
           SIGNED: ${{ steps.sign.outputs.signed }}
+          APP_VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
           flutter pub get
@@ -270,7 +278,7 @@ jobs:
             mkdir -p android
             cp /tmp/key.properties android/key.properties
           fi
-          flutter build apk --release
+          flutter build apk --release --dart-define=APP_VERSION="$APP_VERSION"
           mkdir -p "$GITHUB_WORKSPACE/out"
           cp build/app/outputs/flutter-apk/app-release.apk \
              "$GITHUB_WORKSPACE/out/director-${{ steps.ver.outputs.version }}.apk"
@@ -279,6 +287,7 @@ jobs:
         working-directory: interviewer
         env:
           SIGNED: ${{ steps.sign.outputs.signed }}
+          APP_VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
           flutter pub get
@@ -286,7 +295,7 @@ jobs:
             mkdir -p android
             cp /tmp/key.properties android/key.properties
           fi
-          flutter build apk --release
+          flutter build apk --release --dart-define=APP_VERSION="$APP_VERSION"
           mkdir -p "$GITHUB_WORKSPACE/out"
           cp build/app/outputs/flutter-apk/app-release.apk \
              "$GITHUB_WORKSPACE/out/interviewer-${{ steps.ver.outputs.version }}.apk"

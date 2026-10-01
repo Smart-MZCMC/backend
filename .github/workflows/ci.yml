@@ -158,7 +158,10 @@ jobs:
         run: |
           flutter --version
           flutter pub get
-          flutter build web --release --base-href /interviewer/ --no-web-resources-cdn
+          # ci.yml 没有 Resolve version 步骤，给一个明确的开发版占位值。
+          # 不能留空：那会让客户端拿到空版本号，与后端一比就误报「版本不一致」。
+          flutter build web --release --base-href /interviewer/ --no-web-resources-cdn \
+            --dart-define=APP_VERSION=0.0.0-dev
           node trim-web.mjs build/web
       # 6. 把三个站点的产物放进后端静态目录
       - name: Copy static sites into public/
