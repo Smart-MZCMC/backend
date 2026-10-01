@@ -1,0 +1,1 @@
+import{a as e,o as t}from"./Cf8hpcIl.js";function n(t){return e[t]??t}function r(e,n){return e?(t[e]??0)>=t[n]:!1}var i={super_admin:`error`,admin:`warning`,leader:`info`,pre_production:`theme`,logistics:`neutral`,director:`success`};function a(e){return i[e]??`neutral`}export{n,a as r,r as t};
