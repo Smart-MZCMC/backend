@@ -67,9 +67,17 @@ func resolveActor(ctx http.Context, needLabel string) (models.User, *authzError)
 		return models.User{}, &authzError{401, "无效的用户ID"}
 	}
 
+	// ID == 0 的判断不能省：First 查不到时不报错，见 jwt.go 里的说明。
 	var user models.User
-	if err := facades.Orm().Query().Where("id = ?", userID).First(&user); err != nil {
+	if err := facades.Orm().Query().Where("id = ?", userID).First(&user); err != nil || user.ID == 0 {
 		return models.User{}, &authzError{401, "用户不存在或已被删除"}
+	}
+
+	// 与中间件同一套令牌版本校验：这个路由是公开路由上的自解析，绕过了 Jwt
+	// 中间件，所以必须自己再查一次。改密码后旧令牌在这里也要失效。
+	claimVersion, _ := claims["ver"].(float64)
+	if int(claimVersion) != user.TokenVersion {
+		return models.User{}, &authzError{401, "登录状态已失效，请重新登录（密码可能已变更）"}
 	}
 
 	role := models.Role(user.Role)

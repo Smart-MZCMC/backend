@@ -50,6 +50,11 @@ func Web() {
 	facades.Route().Middleware(middleware.Jwt()).Group(func(r route.Router) {
 		r.Get("/api/auth/profile", authController.Profile)
 
+		// 个人资料：任何人只能改自己，所以不挂角色门槛。
+		// 判定依据是「只操作 ctx 里的那个 id」，不存在越权空间。
+		r.Put("/api/auth/profile", authController.UpdateProfile)
+		r.Put("/api/auth/password", authController.ChangePassword)
+
 		// 角色清单对任意登录用户开放。管理前端据此渲染角色标签与下拉选项，
 		// 而不是在前端再写一份映射——之前 AppShell、用户页、权限分配页各有一处
 		// admin ? '管理员' : '导播' 的三元表达式，加超级管理员后全部会漏改，

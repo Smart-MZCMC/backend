@@ -53,9 +53,41 @@ func (m *JwtMiddleware) Handle(ctx contractshttp.Context) {
 	}
 
 	key, _ := claims["key"].(string)
-	userID, _ := strconv.ParseUint(key, 10, 64)
-	if userID == 0 {
+	userID, err := strconv.ParseUint(key, 10, 64)
+	if err != nil || userID == 0 {
 		ctx.Response().Json(401, map[string]any{"error": "无效的用户ID"}).Abort()
+		return
+	}
+
+	// 校验令牌版本。
+	//
+	// 用户改密码时 token_version 会递增，因此这里能立刻判定令牌已失效，而不必
+	// 等 JWT_TTL（默认 60 分钟）自然过期。只取两列：这是每个请求都会走到的
+	// 路径，不值得把密码哈希也读出来。
+	//
+	// 顺带修掉一个既有漏洞：Jwt 中间件此前完全不查库，所以**被删除的用户的
+	// 令牌在有效期内依然畅通无阻**。既然现在要查，顺手把「用户不存在」一并
+	// 拦下来。
+	//
+	// 令牌里没有 ver 字段的（本次改动前签发的）按 0 处理，与库里的默认值一致，
+	// 升级后老令牌不会被误杀。
+	// 注意 err != nil || X.ID == 0 这个判断：**不能只看 error**。
+	// SQLite 驱动下 First 查不到记录时不返回错误，只是把目标结构体留成零值；
+	// 只判 err 的写法会让「用户/记录不存在」这道守卫完全失效——实测已删除账号
+	// 的令牌在有效期内照样畅通无阻（profile / 改资料 / 读日志全部 200）。
+	// 所有表都是自增主键、ID 从 1 起，所以 ID == 0 即代表没查到。
+	var tokenUser models.User
+	if err := facades.Orm().Query().Select("id", "token_version").
+		Where("id = ?", userID).First(&tokenUser); err != nil || tokenUser.ID == 0 {
+		ctx.Response().Json(401, map[string]any{"error": "用户不存在或已被删除"}).Abort()
+		return
+	}
+
+	claimVersion, _ := claims["ver"].(float64)
+	if int(claimVersion) != tokenUser.TokenVersion {
+		ctx.Response().Json(401, map[string]any{
+			"error": "登录状态已失效，请重新登录（密码可能已变更）",
+		}).Abort()
 		return
 	}
 
@@ -101,7 +133,7 @@ func (m *RoleMiddleware) Handle(ctx contractshttp.Context) {
 	// 必须用 models.User 承载结果：Goravel 的 ORM 依赖模型元数据解析
 	// 字段映射，查进匿名 struct 会直接失败（表现为「用户不存在」）。
 	var user models.User
-	if err := facades.Orm().Query().Where("id = ?", userID).First(&user); err != nil {
+	if err := facades.Orm().Query().Where("id = ?", userID).First(&user); err != nil || user.ID == 0 {
 		ctx.Response().Json(401, map[string]any{"error": "用户不存在或已被删除"}).Abort()
 		return
 	}

@@ -153,232 +153,52 @@ curl -X POST http://127.0.0.1:3000/api/auth/register \
 对 403 的说明：客户端把它当作「当前用户的真实权限状态」，**不会**踢掉登录态，
 所以无权的操作会停在当前页面并提示原因。
 
-成功返回 `201`，其中 `"role":"admin"`：
+## 用户中心
 
-```json
-{"id":1,"username":"admin","display_name":"系统管理员","role":"admin"}
+管理后台「个人中心」在**头像菜单**里（不占侧边栏）：改显示名、邮箱、密码。
+
+### 邮箱
+
+仅用于匹配头像，**不参与登录、不会收到任何邮件**。全局唯一，可以留空。
+写入前统一归一化为「去首尾空格 + 转小写」，所以 `A@x.com` 与 `a@x.com` 视为
+同一个地址（否则两个人会共用一张头像，而且用户会收到莫名其妙的「已被占用」）。
+
+数据库里 `users.email` 上建的是**部分索引**：
+
+```sql
+CREATE UNIQUE INDEX users_email_unique ON users(email)
+  WHERE email IS NOT NULL AND email != ''
 ```
 
-约束：密码至少 6 位；用户名不超过 64 字符，只能用字母、数字、`_`、`.`、`-`
-和中文。`role` 不用传——引导模式下会被忽略。
+不是普通唯一索引。普通索引会让**第二个没填邮箱的账号建不出来**——
+模型里 Email 是普通 string，GORM 给未填邮箱的账号插入的是空串 `''`，
+唯一索引把两个 `''` 判成冲突，而注册接口当时报的是「用户名已存在」，
+错误信息还完全指错了方向。
 
-::: danger 这件事必须在开放端口前做完
-`POST /api/auth/register` 是公开路由。在用户表为空之前，
-**任何能访问到 3000 端口的人**都能抢先注册一个管理员。
-第一个账号建好后接口会自动收紧为「仅管理员可调用」，但那之前没有保护。
+### 头像
 
-验证已经收紧：
+来自 [WeAvatar](https://weavatar.com)，按 `md5(邮箱去空格转小写)` 取，
+与 Gravatar 系服务一致。地址可在 `.env` 里改（`AVATAR_BASE_URL`），
+头像 URL 由后端算好返回——浏览器的 Web Crypto 只有 SHA 系列、没有 MD5，
+放前端算得引第三方依赖。
 
-```sh
-curl -X POST http://127.0.0.1:3000/api/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{"username":"test","password":"test123456","role":"admin"}'
-# 期望：401 {"error":"系统已有账号，创建用户需要管理员登录"}
-```
-:::
+> **本系统不能上传头像。** 需要真头像的用户要先在 weavatar.com 注册、绑定
+> 上面这个邮箱并完成验证；没注册过的邮箱会拿到一个字母头像。
+>
+> 内网无外网时头像可能加载不出来，此时自动回退为首字母圆圈，不影响使用。
+> 头像请求带 `referrerpolicy="no-referrer"`，不会把内网 Origin 带给外部站。
 
-## 五、启动
+### 改密码
 
-```sh
-chmod +x smart-mzcmc start.sh
-./start.sh
-```
+`PUT /api/auth/password`，需要当前密码 + 新密码。改完：
 
-看到 `[WS] 服务器启动: :3002` 与路由表输出即启动成功。
-**验证：** 浏览器打开 `http://<服务器IP>:3000/` ，首页右上角应显示「全部在线」。
+- 库里的 `token_version` 递增，令牌里带的是签发时的版本号，**所有旧令牌立即失效**
+- 三处验签点都比对：HTTP 中间件、`resolveActor`（公开路由自解析）、WebSocket 鉴权
+- 同时返回**新令牌**，当前设备自动续期，不会被自己踢下线
+- 其他设备上的导播端 WebSocket 连接会一并断开
 
-## 六、注册 systemd（推荐）
-
-```sh
-sudo cp smart-mzcmc.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now smart-mzcmc
-sudo systemctl status smart-mzcmc
-```
-
-单元文件里 `WorkingDirectory` 指向解压目录，**这一行不能改**——
-首页、`/admin`、`/docs` 三个静态站点是按进程工作目录解析的
-（`./public/xxx`），跑错目录会 404。采访端则按可执行文件所在目录解析，两者规则不同。
-
-看日志：
-
-```sh
-sudo journalctl -u smart-mzcmc -f
-tail -f storage/logs/goravel.log
-```
-
-## 端口
-
-| 端口 | 用途 | 是否可对外 |
-| --- | --- | --- |
-| 3000 | HTTP API、首页、管理后台、文档站 | 见下 |
-| 3002 | WebSocket Hub、采访端 Web | 见下 |
-
-**推荐做法：两个端口都只监听 `127.0.0.1`，对外只暴露反向代理的 80/443。**
-只开 3000 的话，首页会显示「WebSocket 不可达」，各端客户端会持续重连。
-
-systemd 单元里 `ExecStart` 用的是本机地址，天然只监听回环——这一点不用额外配置。
-
-### 反向代理（生产）
-
-在前面放一层 nginx，把 3000 和 3002 收拢到同一个域名。
-完整的配置说明和排错清单见 `docs/operation-manual.md` 的「反向代理部署」。
-
-最小可用版本：
-
-```nginx
-# 必须在 http {} 块里。宝塔的 vhost 文件在 http 块内 include，所以写在 server 之前即可。
-# 变量名加 smartmzcmc_ 前缀，避免和宝塔可能已定义的 $connection_upgrade 撞名。
-map $http_upgrade $smartmzcmc_connection_upgrade {
-    default upgrade;
-    ''      close;
-}
-
-server {
-    listen 80;
-    server_name zhdb.647382.xyz;
-
-    # 3002：WebSocket。用 ^~ 前缀匹配而非 = /ws，因为 /ws/status 也要走这里。
-    # 不能写成 /ws/ —— 后端 Go ServeMux 把 "/ws" 注册为精确匹配。
-    location ^~ /ws {
-        proxy_pass http://127.0.0.1:3002;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade    $http_upgrade;
-        proxy_set_header Connection $smartmzcmc_connection_upgrade;
-        proxy_set_header Host              $host;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        # 默认 60s 会掐掉空闲连接；笔记本休眠时客户端心跳会停，
-        # 60s 断线会让服务端释放导播控制权，画面可能被另一位导播抢走。
-        proxy_read_timeout 300s;
-        proxy_buffering off;
-    }
-
-    # 3002：采访端
-    location ^~ /interviewer/ {
-        proxy_pass http://127.0.0.1:3002;
-        proxy_set_header Host $host;
-    }
-
-    # 3000：其余全部
-    location / {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Host              $host;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-```
-
-::: warning 用宝塔面板时务必检查两点
-1. **删掉 `include /www/server/panel/vhost/rewrite/go_*.conf;`**
-   那是宝塔「Go 项目」框架的伪静态模板，会重写查询串。本项目所有接口都靠
-   查询串传参（`/ws?project_id=1&role=director&token=...`），被重写后各端直接连不上。
-2. **不要把 `Connection` 写死成 `"upgrade"`**
-   那样普通 HTTP GET 也会带上 `Connection: upgrade`，破坏上游 keepalive。
-   用上面的 `map`。
-:::
-
-验证：
-
-```sh
-curl -I http://zhdb.647382.xyz/                         # 200
-curl    http://zhdb.647382.xyz/ws/status                # {"status":"ok",...}
-curl -I http://zhdb.647382.xyz/interviewer/             # 200
-curl -I http://zhdb.647382.xyz/interviewer/config.json  # 200
-```
-
-`curl` 测不出 WebSocket（不发 Upgrade 头），直接看系统首页右上角的连接状态最快。
-
-### 配好反代后，各端填什么
-
-| 端 | 配置文件 | 值 | 要重新编译？ |
-| --- | --- | --- | --- |
-| 管理后台 | 无需配置 | — | 否 |
-| 解说端 | exe 同目录 `config.json` | `"WsUrl": "ws://zhdb.647382.xyz/ws"` | **否**，重启 exe |
-| 包装端 | exe 同目录 `config.json` | 同上 | **否**，重启 exe |
-| 采访端 | `public/interviewer/config.json` | `"wsUrl": "ws://zhdb.647382.xyz/ws"` | **否**，刷新浏览器 |
-| 导播端 | `director/lib/config.dart` | `serverUrl` + `wsUrl` | **是** |
-
-::: danger 启用 HTTPS 之后，全部改成 `wss://`
-浏览器把 https 页面里的 `ws://` 判为**混合内容**直接拦掉，连不上而且**不报错**——
-表现就是各端状态灯一直转圈。需要改：两个桌面端的 `config.json`、
-`public/interviewer/config.json`、以及 `director/lib/config.dart`（并重新编译）。
-`serverUrl` 同理改成 `https://`。
-:::
-
-## 防火墙
-
-配了反向代理时，只放通代理的 80/443：
-
-```sh
-sudo firewall-cmd --add-port=80/tcp --permanent
-sudo firewall-cmd --add-port=443/tcp --permanent
-sudo firewall-cmd --reload
-```
-
-没配反代、要直连 3002 的话才需要额外放通 3000 和 3002：
-
-```sh
-sudo firewall-cmd --add-port=3000/tcp --permanent
-sudo firewall-cmd --add-port=3002/tcp --permanent
-sudo firewall-cmd --reload
-```
-
-## 常见问题
-
-**启动报 `Please initialize APP_KEY first`**
-`.env` 里的 `APP_KEY` 是空的，或 `.env` 不在当前工作目录。`APP_KEY` 必须是 32 位字符串。
-
-**访问 `/admin` 或 `/docs` 返回 404，页面显示「站点产物未就绪」**
-进程工作目录不对。`WorkingDirectory` 必须指向包含 `public/` 的那一层。
-用 `./start.sh` 启动或保持 systemd 单元文件里的 `WorkingDirectory` 即可。
-
-**首页显示「WebSocket 不可达」**
-3002 没起来，或反代没配 `/ws`。先在服务器本机验证：
-
-```sh
-curl http://127.0.0.1:3002/ws/status     # 期望 {"status":"ok",...}
-```
-
-本机通、但首页说不可达 → 反代少了 `location ^~ /ws`，或者写成了 `/ws/`
-（后端 `ServeMux` 把 `/ws` 注册为精确匹配，带斜杠匹配不上）。
-
-**日志报 `sqlite3: unable to open database file`**
-工作目录不可写。程序会自动创建 `database/`，但前提是当前目录有写权限。
-
-**各端客户端连不上**
-按部署形态二选一，别混用：
-
-| 形态 | `WsUrl` |
-| --- | --- |
-| 直连 | `ws://<服务器IP>:3002/ws` |
-| 反代 | `ws://<域名>/ws` |
-
-别填 `127.0.0.1`——那是客户端自己。
-
-**采访端页面白屏（所有资源 404）**
-`flutter build web` 漏了 `--base-href /interviewer/`。用
-`interviewer/build-web.bat` 构建，它已经把参数带上了。详见 `interviewer/README.md`。
-
-**采访端能打开但一直转圈连不上**
-`public/interviewer/config.json` 里的 `wsUrl` 写成了 `ws://` 而页面是 `https://`
-——混合内容被浏览器拦掉，且**不报错**。改成 `wss://`。
-
-**管理后台「新建用户」报 401**
-说明当前没有管理员登录态。该接口在用户表非空后只接受管理员调用，
-这是预期行为。用第一个管理员账号登录后再操作。
-
-**有人抢先注册了管理员**
-如果端口在创建首个账号前就对外开放过，库里可能已有陌生账号。
-用管理员账号登录后进「用户管理」删掉它；或者直接停服、
-清空 `database/smart-mzcmc.db` 后重启（会丢失全部数据），
-再重新走一遍初始化流程。
-
-**改了首页但浏览器还是旧内容**
-已带 `Cache-Control: no-cache`，正常会自动回源校验。
-若前面挂了 Nginx 且它自己配了缓存，需要在 Nginx 侧也对 HTML 关缓存。
+> 升级前签发的令牌仍可用（令牌里没有版本号，按 0 处理，与数据库默认值一致），
+> 到期后自然失效。若要求升级即失效，需要让用户重新登录一次。
 
 ## 健康检查
 

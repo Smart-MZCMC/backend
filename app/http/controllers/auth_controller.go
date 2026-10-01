@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -21,7 +22,11 @@ func NewAuthController() *AuthController {
 }
 
 // 手动签发 JWT，绕过 Guard（Guard 内部可能因 cache 未初始化而 panic）
-func generateToken(userID uint) (string, error) {
+//
+// user 的 token_version 会写进 ver 声明：用户改密码时库里的值递增，三处
+// 验签点都比对它，于是「改完密码立刻让所有旧令牌作废」才成立，而不是等
+// JWT_TTL（默认 60 分钟）自然过期。
+func generateToken(user models.User) (string, error) {
 	secret := facades.Config().GetString("jwt.secret")
 	if secret == "" {
 		return "", fmt.Errorf("jwt.secret 未配置")
@@ -34,7 +39,8 @@ func generateToken(userID uint) (string, error) {
 
 	now := time.Now()
 	claims := jwt.MapClaims{
-		"key": strconv.FormatUint(uint64(userID), 10),
+		"key": strconv.FormatUint(uint64(user.ID), 10),
+		"ver": user.TokenVersion,
 		"exp": now.Add(time.Duration(ttl) * time.Minute).Unix(),
 		"iat": now.Unix(),
 		"sub": "user",
@@ -53,7 +59,7 @@ func (c *AuthController) Login(ctx http.Context) http.Response {
 	}
 
 	var user models.User
-	if err := facades.Orm().Query().Where("username = ?", username).First(&user); err != nil {
+	if err := facades.Orm().Query().Where("username = ?", username).First(&user); err != nil || user.ID == 0 {
 		log.Printf("[AUTH] 用户不存在: %s", username)
 		return ctx.Response().Json(401, map[string]any{"error": "用户名或密码错误"})
 	}
@@ -63,7 +69,7 @@ func (c *AuthController) Login(ctx http.Context) http.Response {
 		return ctx.Response().Json(401, map[string]any{"error": "用户名或密码错误"})
 	}
 
-	token, err := generateToken(user.ID)
+	token, err := generateToken(user)
 	if err != nil {
 		log.Printf("[AUTH] 生成令牌失败: %v", err)
 		return ctx.Response().Json(500, map[string]any{"error": "生成令牌失败: " + err.Error()})
@@ -71,12 +77,7 @@ func (c *AuthController) Login(ctx http.Context) http.Response {
 
 	return ctx.Response().Json(200, map[string]any{
 		"token": token,
-		"user": map[string]any{
-			"id":           user.ID,
-			"username":     user.Username,
-			"display_name": user.DisplayName,
-			"role":         user.Role,
-		},
+		"user":  userPayload(user),
 	})
 }
 
@@ -187,9 +188,27 @@ func (c *AuthController) Register(ctx http.Context) http.Response {
 		Role:        role,
 	}
 
+	// 先查用户名再插入：真正的唯一性由索引兜底，但这里查一次能让绝大多数
+	// 「重名」得到精确提示，而不是笼统的「用户名或邮箱已被占用」。
+	taken, err := facades.Orm().Query().Model(&models.User{}).
+		Where("username = ?", username).Count()
+	if err != nil {
+		log.Printf("[AUTH] 查询用户名失败: %v", err)
+		return ctx.Response().Json(500, map[string]any{"error": "创建用户失败"})
+	}
+	if taken > 0 {
+		return ctx.Response().Json(409, map[string]any{"error": "用户名已存在"})
+	}
+
 	if err := facades.Orm().Query().Create(&user); err != nil {
 		log.Printf("[AUTH] 创建用户失败: %v", err)
-		return ctx.Response().Json(409, map[string]any{"error": "用户名已存在"})
+		// 不要在此断言是哪个约束冲突：users 上现在有 username 与 email 两个
+		// 唯一索引，写死「用户名已存在」在邮箱冲突时会给出完全指错方向的提示
+		// （之前加 email 列时就踩过一次，插空邮箱的第二个用户被报成用户名重复）。
+		// 用户名是否重复上面已经查过了，所以走到这里更可能是别的约束或底层错误。
+		return ctx.Response().Json(409, map[string]any{
+			"error": "创建用户失败：用户名或邮箱已被占用",
+		})
 	}
 
 	if bootstrap {
@@ -231,18 +250,179 @@ func (c *AuthController) BootstrapStatus(ctx http.Context) http.Response {
 	return ctx.Response().Json(200, map[string]any{"needs_bootstrap": count == 0})
 }
 
-func (c *AuthController) Profile(ctx http.Context) http.Response {
-	userID := ctx.Value("user_id")
-
-	var user models.User
-	if err := facades.Orm().Query().Where("id = ?", userID).First(&user); err != nil {
-		return ctx.Response().Json(404, map[string]any{"error": "用户不存在"})
-	}
-
-	return ctx.Response().Json(200, map[string]any{
+// userPayload 是登录与个人资料接口返回的用户信息。
+//
+// 集中成一个函数是因为三处（登录、profile、更新）必须返回完全一致的字段，
+// 之前是各写各的 map，很容易漏掉一个字段导致前端拿到 undefined。
+func userPayload(user models.User) map[string]any {
+	return map[string]any{
 		"id":           user.ID,
 		"username":     user.Username,
 		"display_name": user.DisplayName,
 		"role":         user.Role,
+		"role_label":   models.Role(user.Role).Label(),
+		"email":        user.Email,
+		// 为空表示未设置邮箱，前端据此回退到首字母圆圈而不是加载图片。
+		"avatar_url": user.AvatarURL(),
+	}
+}
+
+func (c *AuthController) Profile(ctx http.Context) http.Response {
+	user, err := selfUser(ctx)
+	if err != nil {
+		return ctx.Response().Json(404, map[string]any{"error": err.Error()})
+	}
+	return ctx.Response().Json(200, userPayload(user))
+}
+
+// selfUser 取出当前登录用户。
+func selfUser(ctx http.Context) (models.User, error) {
+	userID := ctx.Value("user_id")
+
+	// ID == 0 的判断不能省：First 查不到时不报错，见 jwt.go 里的说明。
+	var user models.User
+	if err := facades.Orm().Query().Where("id = ?", userID).First(&user); err != nil || user.ID == 0 {
+		return models.User{}, errors.New("用户不存在")
+	}
+	return user, nil
+}
+
+// UpdateProfile 修改自己的显示名与邮箱。
+//
+// 挂在 Jwt() 组内、不带角色门槛——任何人只能改自己，这是个人资料而不是管理
+// 操作。真正的判定是「只操作 ctx 里的那个 id」，不存在越权空间。
+func (c *AuthController) UpdateProfile(ctx http.Context) http.Response {
+	user, err := selfUser(ctx)
+	if err != nil {
+		return ctx.Response().Json(404, map[string]any{"error": err.Error()})
+	}
+
+	// 语义要区分「传了空串」（= 清空）与「没传」（= 不动），
+	// 而 ContextRequest 没有 Has()，只能用 All() 判键是否存在。
+	// 前端永远把两个字段一起发上来。
+	input := ctx.Request().All()
+	updates := map[string]any{}
+
+	if _, hasName := input["display_name"]; hasName {
+		name := strings.TrimSpace(ctx.Request().Input("display_name", ""))
+		if len(name) > 100 {
+			return ctx.Response().Json(400, map[string]any{"error": "显示名不能超过 100 个字符"})
+		}
+		updates["display_name"] = name
+	}
+
+	if _, hasEmail := input["email"]; hasEmail {
+		email := models.NormalizeEmail(ctx.Request().Input("email", ""))
+		if email != "" && !models.ValidEmail(email) {
+			return ctx.Response().Json(400, map[string]any{
+				"error": "邮箱格式不正确",
+			})
+		}
+
+		if email != user.Email {
+			// 先查再改，是为了让错误信息可读；唯一索引仍然兜底，
+			// 防止两个请求并发时都通过检查。
+			taken, err := facades.Orm().Query().Model(&models.User{}).
+				Where("email = ?", email).Count()
+			if err != nil {
+				return ctx.Response().Json(500, map[string]any{"error": "查询邮箱失败"})
+			}
+			if taken > 0 {
+				return ctx.Response().Json(409, map[string]any{
+					"error": "该邮箱已被其他账号使用",
+				})
+			}
+		}
+		updates["email"] = email
+	}
+
+	if len(updates) == 0 {
+		return ctx.Response().Json(400, map[string]any{"error": "没有需要更新的内容"})
+	}
+
+	if _, err := facades.Orm().Query().Model(&models.User{}).
+		Where("id = ?", user.ID).Update(updates); err != nil {
+		// 唯一索引冲突也走到这里（并发写入）。
+		log.Printf("[AUTH] 更新个人资料失败 user=%d: %v", user.ID, err)
+		return ctx.Response().Json(409, map[string]any{"error": "该邮箱已被其他账号使用"})
+	}
+
+	// 回读而不是拿内存里的 user 拼：邮箱可能被唯一索引拒绝、或者
+	// AvatarURL 依赖的是归一化后的实际值。
+	updated, err := selfUser(ctx)
+	if err != nil {
+		return ctx.Response().Json(500, map[string]any{"error": "更新后读取失败"})
+	}
+
+	log.Printf("[AUTH] 用户 %s(#%d) 更新了个人资料", user.Username, user.ID)
+	return ctx.Response().Json(200, userPayload(updated))
+}
+
+// ChangePassword 修改自己的密码。
+//
+// 改完立即让所有旧令牌失效：token_version 递增，而令牌里带的是签发时的版本号。
+// 三处验签点（Jwt 中间件、resolveActor、WebSocket）都比对它。
+//
+// 同时返回新令牌，否则当前设备会被自己刚改的密码踢下线。
+func (c *AuthController) ChangePassword(ctx http.Context) http.Response {
+	user, err := selfUser(ctx)
+	if err != nil {
+		return ctx.Response().Json(404, map[string]any{"error": err.Error()})
+	}
+
+	current := ctx.Request().Input("current_password", "")
+	next := ctx.Request().Input("new_password", "")
+
+	// 当前密码错误必须返回 400 而不是 401：前端的统一处理会在收到 401 时
+	// 清掉登录态并跳回登录页——用户改密码时手滑输错一次就被登出，体验上
+	// 等于「改密码功能把账号锁了」。
+	if current == "" || !facades.Hash().Check(current, user.Password) {
+		return ctx.Response().Json(400, map[string]any{"error": "当前密码不正确"})
+	}
+	if len(next) < minPasswordLength {
+		return ctx.Response().Json(400, map[string]any{
+			"error": fmt.Sprintf("新密码至少 %d 位", minPasswordLength),
+		})
+	}
+	if next == current {
+		return ctx.Response().Json(400, map[string]any{"error": "新密码不能与当前密码相同"})
+	}
+
+	hashed, err := facades.Hash().Make(next)
+	if err != nil {
+		log.Printf("[AUTH] 密码加密失败: %v", err)
+		return ctx.Response().Json(500, map[string]any{"error": "密码加密失败"})
+	}
+
+	// 一次写入同时更新密码哈希与令牌版本：两者必须同时生效，
+	// 分两次写的话中间失败会留下「新密码 + 旧版本」的组合。
+	result, err := facades.Orm().Query().Model(&models.User{}).
+		Where("id = ?", user.ID).Update(map[string]any{
+		"password":      hashed,
+		"token_version": user.TokenVersion + 1,
+	})
+	if err != nil {
+		log.Printf("[AUTH] 修改密码失败 user=%d: %v", user.ID, err)
+		return ctx.Response().Json(500, map[string]any{"error": "修改密码失败"})
+	}
+	if result.RowsAffected == 0 {
+		return ctx.Response().Json(404, map[string]any{"error": "用户不存在"})
+	}
+
+	// 用递增后的版本号签发，否则新令牌会立刻因为版本不匹配而失效。
+	fresh := user
+	fresh.TokenVersion = user.TokenVersion + 1
+
+	token, err := generateToken(fresh)
+	if err != nil {
+		log.Printf("[AUTH] 生成新令牌失败: %v", err)
+		return ctx.Response().Json(500, map[string]any{"error": "生成新令牌失败"})
+	}
+
+	log.Printf("[AUTH] 用户 %s(#%d) 修改了密码，所有旧令牌已失效", user.Username, user.ID)
+
+	return ctx.Response().Json(200, map[string]any{
+		"token": token,
+		"user":  userPayload(fresh),
 	})
 }

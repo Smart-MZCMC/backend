@@ -58,7 +58,11 @@ func ProjectStatsHandler(ctx http.Context) http.Response {
 	msgCount, _ := facades.Orm().Query().Model(&models.Message{}).Where("project_id = ?", projectID).Count()
 
 	var lock models.ProjectLock
-	lockExists := facades.Orm().Query().Where("project_id = ?", projectID).First(&lock) == nil
+	// ID == 0 的判断不能省：First 查不到记录时不返回错误（只把结构体留成零值），
+	// 只判 error 的话 lockExists 恒为 true，项目统计里的「锁定中」永远是开的。
+	// 说明见 app/http/middleware/jwt.go。
+	lockExists := facades.Orm().Query().Where("project_id = ?", projectID).
+		First(&lock) == nil && lock.ID != 0
 	lockActive := lockExists && time.Now().Before(lock.ExpireAt)
 
 	interviewCount, _ := facades.Orm().Query().Model(&models.InterviewStatus{}).Where("project_id = ?", projectID).Count()

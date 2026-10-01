@@ -21,5 +21,7 @@ func Migrations() []schema.Migration {
 		&migrations.M20260926000001PurgeHeartbeatMessages{},
 		// 引入超级管理员后，为存量部署补一个，否则没人能授予该角色
 		&migrations.M20261001000001EnsureSuperAdmin{},
+		// 用户中心：邮箱（WeAvatar 头像来源）与令牌版本（改密码即失效）
+		&migrations.M20261002000001AddUserProfileFields{},
 	}
 }

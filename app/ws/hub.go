@@ -178,7 +178,7 @@ func HandleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		userID = uint(uid)
 	}
 
-	if role == "director" || role == "admin" {
+	if role == "director" || role == "admin" || role == "super_admin" {
 		if token == "" {
 			http.Error(w, `{"error":"需要认证"}`, http.StatusUnauthorized)
 			return
@@ -190,6 +190,12 @@ func HandleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		parsedToken, err := jwt.Parse(token, func(t *jwt.Token) (interface{}, error) {
+			// 必须检查算法。缺这一步的话，把 alg 改成 none 或非 HMAC 的令牌
+			// 可能被接受——另外两处验签点（中间件、resolveActor）都有这个检查，
+			// 只有这里没有。
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+			}
 			return []byte(secret), nil
 		})
 		if err != nil || !parsedToken.Valid {
@@ -203,6 +209,25 @@ func HandleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		}
 		key, _ := claims["key"].(string)
 		uid, _ := strconv.ParseUint(key, 10, 64)
+		if uid == 0 {
+			http.Error(w, `{"error":"无效的用户ID"}`, http.StatusUnauthorized)
+			return
+		}
+
+		// 校验令牌版本，与 HTTP 侧同一套规则：改密码后旧令牌的 WebSocket 连接
+		// 也必须连不上，否则「改密码即失效」在直播链路上是漏的。
+		var tokenUser models.User
+		if err := facades.Orm().Query().Select("id", "token_version").
+			Where("id = ?", uid).First(&tokenUser); err != nil || tokenUser.ID == 0 {
+			http.Error(w, `{"error":"用户不存在或已被删除"}`, http.StatusUnauthorized)
+			return
+		}
+		claimVersion, _ := claims["ver"].(float64)
+		if int(claimVersion) != tokenUser.TokenVersion {
+			http.Error(w, `{"error":"登录状态已失效，请重新登录"}`, http.StatusUnauthorized)
+			return
+		}
+
 		userID = uint(uid)
 	}
 
@@ -259,7 +284,8 @@ func HandleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 func autoAcquireLock(projectID, userID uint, client *Client) {
 	var existing models.ProjectLock
 	err := facades.Orm().Query().Where("project_id = ?", projectID).First(&existing)
-	if err == nil {
+	// ID == 0 的判断不能省：First 查不到时不报错，见 jwt.go 里的说明。
+	if err == nil && existing.ID != 0 {
 		// 锁存在
 		if time.Now().Before(existing.ExpireAt) {
 			if existing.UserID == userID {
@@ -305,7 +331,7 @@ func autoAcquireLock(projectID, userID uint, client *Client) {
 func checkLockHolder(projectID, userID uint) bool {
 	var lock models.ProjectLock
 	err := facades.Orm().Query().Where("project_id = ?", projectID).First(&lock)
-	if err != nil {
+	if err != nil || lock.ID == 0 {
 		return false
 	}
 	if time.Now().After(lock.ExpireAt) {
@@ -319,7 +345,7 @@ func checkLockHolder(projectID, userID uint) bool {
 func releaseLockOnDisconnect(projectID, userID uint, client *Client) {
 	var lock models.ProjectLock
 	err := facades.Orm().Query().Where("project_id = ? AND user_id = ?", projectID, userID).First(&lock)
-	if err != nil {
+	if err != nil || lock.ID == 0 {
 		return
 	}
 	facades.Orm().Query().Where("id = ?", lock.ID).Delete(&models.ProjectLock{})

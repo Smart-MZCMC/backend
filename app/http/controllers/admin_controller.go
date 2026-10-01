@@ -115,7 +115,7 @@ func (c *AdminController) UpdateUserRole(ctx http.Context) http.Response {
 // loadUser 按 ID 取用户。
 func loadUser(id int) (models.User, error) {
 	var user models.User
-	if err := facades.Orm().Query().Where("id = ?", id).First(&user); err != nil {
+	if err := facades.Orm().Query().Where("id = ?", id).First(&user); err != nil || user.ID == 0 {
 		return models.User{}, err
 	}
 	return user, nil
@@ -167,7 +167,8 @@ func (c *AdminController) UpdateProject(ctx http.Context) http.Response {
 	}
 
 	if len(updates) > 0 {
-		if _, err := facades.Orm().Query().Where("id = ?", id).Update(updates); err != nil {
+		if _, err := facades.Orm().Query().Model(&models.Project{}).
+			Where("id = ?", id).Update(updates); err != nil {
 			return ctx.Response().Json(500, map[string]any{"error": "更新项目失败"})
 		}
 	}

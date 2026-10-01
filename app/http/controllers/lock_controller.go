@@ -28,7 +28,8 @@ func (c *LockController) Acquire(ctx http.Context) http.Response {
 
 	var existing models.ProjectLock
 	err := facades.Orm().Query().Where("project_id = ?", projectID).First(&existing)
-	if err == nil {
+	// ID == 0 的判断不能省：First 查不到时不报错，见 jwt.go 里的说明。
+	if err == nil && existing.ID != 0 {
 		if time.Now().Before(existing.ExpireAt) {
 			if existing.UserID == userID {
 				return ctx.Response().Json(200, map[string]any{
@@ -80,7 +81,7 @@ func (c *LockController) Release(ctx http.Context) http.Response {
 	}
 
 	var lock models.ProjectLock
-	if err := facades.Orm().Query().Where("project_id = ? AND user_id = ?", projectID, userID).First(&lock); err != nil {
+	if err := facades.Orm().Query().Where("project_id = ? AND user_id = ?", projectID, userID).First(&lock); err != nil || lock.ID == 0 {
 		return ctx.Response().Json(404, map[string]any{"error": "未持有该控制权"})
 	}
 
@@ -102,7 +103,7 @@ func (c *LockController) Heartbeat(ctx http.Context) http.Response {
 	userID := ctx.Value("user_id").(uint)
 
 	var lock models.ProjectLock
-	if err := facades.Orm().Query().Where("project_id = ? AND user_id = ?", projectID, userID).First(&lock); err != nil {
+	if err := facades.Orm().Query().Where("project_id = ? AND user_id = ?", projectID, userID).First(&lock); err != nil || lock.ID == 0 {
 		return ctx.Response().Json(404, map[string]any{"error": "未持有控制权，需重新获取"})
 	}
 
@@ -119,7 +120,7 @@ func (c *LockController) Status(ctx http.Context) http.Response {
 	projectID, _ := strconv.Atoi(ctx.Request().Route("projectId"))
 
 	var lock models.ProjectLock
-	if err := facades.Orm().Query().Where("project_id = ?", projectID).First(&lock); err != nil {
+	if err := facades.Orm().Query().Where("project_id = ?", projectID).First(&lock); err != nil || lock.ID == 0 {
 		return ctx.Response().Json(200, map[string]any{"locked": false})
 	}
 
