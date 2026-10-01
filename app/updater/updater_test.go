@@ -4,6 +4,8 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -439,5 +441,93 @@ func TestBeginProgress_ResetsPreviousRun(t *testing.T) {
 	}
 	if len(got.Steps) != 0 {
 		t.Fatalf("新一轮不该带着上一轮的日志: %v", got.Steps)
+	}
+}
+
+// 校验值来源：这是引入下载镜像带来的一处安全退化，必须能被测试钉住。
+//
+// 用了镜像之后，checksums.txt 默认也经镜像取——于是校验和与被校验的包由同一方
+// 提供，攻破镜像即可同时替换两者，sha256 校验形同虚设。配了 ChecksumURL
+// 之后才恢复成「异源比对」。
+//
+// 用两个本地 server 区分「包从哪来」和「校验值从哪来」，断言真的打到了不同的
+// 地址——只验字段存不存在毫无意义，那正是这处退化最初被忽略的原因。
+func TestFetchAsset_ChecksumComesFromTrustedSource(t *testing.T) {
+	var mirrorHits, trustHits int
+
+	// 镜像：包与（未配可信源时）校验值都从这里出
+	mirror := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mirrorHits++
+		w.Write([]byte("from-mirror"))
+	}))
+	defer mirror.Close()
+
+	// 可信源：只提供校验值
+	trust := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		trustHits++
+		w.Write([]byte("from-trust"))
+	}))
+	defer trust.Close()
+
+	rel := &release{TagName: "v1.0.0"}
+	rel.Assets = append(rel.Assets, struct {
+		Name               string `json:"name"`
+		BrowserDownloadURL string `json:"browser_download_url"`
+		Size               int64  `json:"size"`
+	}{Name: "checksums.txt", BrowserDownloadURL: mirror.URL + "/checksums.txt"})
+
+	// 未配 ChecksumURL：校验值与包同源（不安全但可用）
+	plain := New(Config{DownloadMirror: mirror.URL}, nil)
+	body, err := plain.fetchAsset(rel, checksumFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "from-mirror" || mirrorHits != 1 || trustHits != 0 {
+		t.Fatalf("未配可信源时应走镜像: body=%q mirror=%d trust=%d", body, mirrorHits, trustHits)
+	}
+
+	// 配了 ChecksumURL：必须绕开镜像
+	pinned := New(Config{DownloadMirror: mirror.URL, ChecksumURL: trust.URL + "/sums.txt"}, nil)
+	body, err = pinned.fetchAsset(rel, checksumFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "from-trust" {
+		t.Fatalf("配了可信源就不该走镜像，实际拿到 %q", body)
+	}
+	if trustHits != 1 {
+		t.Fatalf("应恰好请求一次可信源，实际 %d 次", trustHits)
+	}
+}
+
+// 普通资产不受 ChecksumURL 影响：那个配置只针对校验清单。
+// 把它错当成全局 URL 覆盖的话，所有资产都会去同一个地址拿，明显是配置写坏了。
+func TestFetchAsset_ChecksumURLDoesNotAffectOtherAssets(t *testing.T) {
+	var mirrorHits, trustHits int
+	mirror := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mirrorHits++
+		w.Write([]byte("asset-from-mirror"))
+	}))
+	defer mirror.Close()
+	trust := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		trustHits++
+		w.Write([]byte("wrong"))
+	}))
+	defer trust.Close()
+
+	rel := &release{TagName: "v1.0.0"}
+	rel.Assets = append(rel.Assets, struct {
+		Name               string `json:"name"`
+		BrowserDownloadURL string `json:"browser_download_url"`
+		Size               int64  `json:"size"`
+	}{Name: "bundle.tar.gz", BrowserDownloadURL: mirror.URL + "/bundle.tar.gz"})
+
+	u := New(Config{DownloadMirror: mirror.URL, ChecksumURL: trust.URL}, nil)
+	body, err := u.fetchAsset(rel, "bundle.tar.gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "asset-from-mirror" || mirrorHits != 1 || trustHits != 0 {
+		t.Fatalf("普通资产必须走镜像: body=%q mirror=%d trust=%d", body, mirrorHits, trustHits)
 	}
 }

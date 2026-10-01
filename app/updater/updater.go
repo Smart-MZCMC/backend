@@ -28,6 +28,10 @@ import (
 	"time"
 )
 
+// checksumFile 是校验清单的文件名，单独提出来是因为 fetchAsset 要靠它判断
+// 「该不该改用可信源」。
+const checksumFile = "checksums.txt"
+
 // Config 是更新功能的运行参数，来自 config/update.go。
 type Config struct {
 	Enabled      bool
@@ -40,10 +44,15 @@ type Config struct {
 
 	// DownloadMirror 是资产下载镜像的前缀。为空表示直接从 GitHub 下载。
 	//
-	// 只影响**下载地址**，不影响校验：sha256 比对照旧要做，而且必须做。
-	// 引入第三方镜像因此不会削弱完整性保证——镜像返回一个 HTML 错误页
-	// 或旧版本，都会在 verifyChecksum 那里被挡住。
+	// ⚠️ 用了镜像就意味着**包的校验值也来自镜像**（除非另外配了 ChecksumURL）：
+	// 校验和与被校验的包由同一方提供，攻破镜像即可同时替换两者，让 sha256
+	// 校验形同虚设。这是引入镜像必须一起付的代价，不是可以忽略的实现细节。
+	// 要保留真正的完整性保证，把 ChecksumURL 指到一个与镜像无关的可信源。
 	DownloadMirror string
+
+	// ChecksumURL 是 checksums.txt 的可信地址。为空表示跟随资产来源
+	// （即同样经 DownloadMirror 取回）。
+	ChecksumURL string
 }
 
 func (c Config) apiBase() string {
@@ -428,7 +437,7 @@ func (u *Updater) ApplyWithProgress(current, allowTarget, binaryName string, pro
 	if err != nil {
 		return nil, err
 	}
-	checksums, err := u.fetchAsset(rel, "checksums.txt")
+	checksums, err := u.fetchAsset(rel, checksumFile)
 	if err != nil {
 		return nil, fmt.Errorf("无法获取 checksums.txt，拒绝在无法校验的情况下继续: %w", err)
 	}
@@ -614,10 +623,18 @@ func (u *Updater) fetchAsset(rel *release, name string) ([]byte, error) {
 	if asset == nil {
 		return nil, fmt.Errorf("发布包 %s 里没有 %s", rel.TagName, name)
 	}
-	// 同样经镜像取。checksums.txt 是**安全判据的来源**，所以它走不走镜像
-	// 都必须能拿到——拿不到就整体拒绝执行（见 Apply 里那句「拒绝在无法校验
-	// 的情况下继续」），不会因为镜像不可用而悄悄跳过校验。
-	req, err := http.NewRequest(http.MethodGet, u.cfg.assetURL(asset.BrowserDownloadURL), nil)
+
+	url := u.cfg.assetURL(asset.BrowserDownloadURL)
+	if name == checksumFile && u.cfg.ChecksumURL != "" {
+		// 校验值改从可信源取。这不是优化，是把 sha256 从「同源自证」变成
+		// 「异源比对」——否则攻破镜像的人同时提供包和校验值就能绕过校验。
+		url = u.cfg.ChecksumURL
+	}
+	if name == checksumFile {
+		u.log("[Update] 校验值来源: %s", u.cfg.ChecksumURL)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}

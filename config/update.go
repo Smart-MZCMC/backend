@@ -29,15 +29,22 @@ func init() {
 		// 于是表现为「能查到有新版，一点更新就卡住不动」。
 		//
 		// 写法是前缀包裹原始 URL，即最终请求 {前缀}{原始URL}：
-		//   UPDATE_DOWNLOAD_MIRROR=https://ghfast.top/
-		//   UPDATE_DOWNLOAD_MIRROR=https://gh-proxy.com/
-		//   UPDATE_DOWNLOAD_MIRROR=http://192.168.1.10/github-proxy/
+		//   UPDATE_DOWNLOAD_MIRROR=https://github.laobinghu.top/
 		// 留空表示直接从 GitHub 下载。
 		//
-		// 走镜像**不会削弱完整性保证**：sha256 校验照做且必须通过，
-		// 镜像返回一个 HTML 错误页或旧版本都会在 verifyChecksum 处被拒绝。
-		// 注意 checksums.txt 也经镜像取，取不到就整体拒绝执行而不是跳过校验。
+		// ⚠️ 用了镜像就意味着**包的校验值也来自镜像**（除非另外配了
+		// checksum_url）：校验和与被校验的包由同一方提供，攻破镜像即可同时
+		// 替换两者，让 sha256 校验形同虚设。要保住真正的完整性保证，把
+		// checksum_url 指到一个与镜像无关的可信源。
 		"download_mirror": config.Env("UPDATE_DOWNLOAD_MIRROR", ""),
+
+		// checksum_url 是 checksums.txt 的可信地址，为空表示跟随资产来源
+		// （即同样经 download_mirror 取回）。
+		//
+		// 这不是可选的优化项，而是用了镜像之后的必要配套：校验和必须来自
+		// 与包不同的源，「异源比对」才是校验，「同源自证」只是形式。
+		// 校园网里常见的做法是把它放到公司内网的 HTTP 服务上。
+		"checksum_url": config.Env("UPDATE_CHECKSUM_URL", ""),
 
 		// GitHub 仓库，owner/repo。仅在 server 为空时用到。
 		"repo": config.Env("UPDATE_REPO", "Smart-MZCMC/backend"),

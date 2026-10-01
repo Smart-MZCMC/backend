@@ -33,6 +33,7 @@ func newUpdater() *updater.Updater {
 		Token:          cfg.GetString("update.token", ""),
 		Timeout:        time.Duration(timeout) * time.Second,
 		DownloadMirror: cfg.GetString("update.download_mirror", ""),
+		ChecksumURL:    cfg.GetString("update.checksum_url", ""),
 	}, func(format string, a ...any) { log.Printf("[Update] "+format, a...) })
 }
 
@@ -58,6 +59,7 @@ func (c *SystemController) Info(ctx http.Context) http.Response {
 			"asset":           cfg.GetString("update.asset", "backend-linux-amd64.tar.gz"),
 			"server":          cfg.GetString("update.server", ""),
 			"download_mirror": cfg.GetString("update.download_mirror", ""),
+			"checksum_url":    cfg.GetString("update.checksum_url", ""),
 		},
 		"operated_by": map[string]any{
 			"username":   actor.Username,

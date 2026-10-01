@@ -351,6 +351,54 @@ jobs:
           done
           [ "$failed" -eq 0 ] || exit 1
 
+      # 验签通过不代表能用。这里查的是「APK 到底声明了哪些权限」。
+      #
+      # 1.4.3 之前的 Flutter 项目只在 src/debug/AndroidManifest.xml 里声明
+      # android.permission.INTERNET（模板注释写着「required for development」，
+      # 那是错的）。结果是：debug 一切正常，release APK 却完全没有联网权限，
+      # 所有 HTTP / WebSocket 请求静默失败。
+      #
+      # 现场表现把所有人都带偏了——客户端把登录失败一律显示成「请检查用户名
+      # 和密码」，而账号密码明明是对的，debug 版同一个账号能登进去。1.4.3 的
+      # 两个 APK 都缺这个权限，直到有人拿 aapt 拆开才确认。
+      #
+      # 权限缺失是构建期就能查出来的事，不该等现场反馈。所以在这里卡一道：
+      # 发出去的 APK 缺 INTERNET 就直接失败，而不是等人来报。
+      - name: Verify APK permissions
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          AAPT="$(ls -d "${ANDROID_HOME}"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$AAPT" ]; then
+            echo "::error::找不到 aapt2（ANDROID_HOME=$ANDROID_HOME）"
+            exit 1
+          fi
+          echo "aapt2: $AAPT"
+
+          failed=0
+          for apk in out/director-"$VERSION".apk out/interviewer-"$VERSION".apk; do
+            if [ ! -f "$apk" ]; then
+              echo "::error::$apk 不存在"
+              failed=1
+              continue
+            fi
+            perms="$("$AAPT" dump permissions "$apk" 2>/dev/null || true)"
+            if ! printf '%s' "$perms" | grep -q 'android.permission.INTERNET'; then
+              echo "::error::$apk 没有声明 android.permission.INTERNET —— 这个包无法联网。"
+              echo "::error::检查 android/app/src/main/AndroidManifest.xml，INTERNET 必须声明在 main 里。"
+              failed=1
+            else
+              echo "OK  $apk  含 INTERNET 权限"
+            fi
+            # debuggable 出现在 release 包里说明变体选错了，等同于发了 debug 包
+            if "$AAPT" dump badging "$apk" 2>/dev/null | grep -q "application-debuggable"; then
+              echo "::error::$apk 是 debuggable 的，构建变体选错了（要 release）"
+              failed=1
+            fi
+          done
+          [ "$failed" -eq 0 ] || exit 1
+
       - name: Collect and checksum
         run: |
           set -euo pipefail
