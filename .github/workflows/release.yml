@@ -389,16 +389,25 @@ jobs:
 
             完整步骤见包内 `DEPLOY.md`；反向代理配置见 `docs/operation-manual.md`。
 
-            ### 创建管理员
+            ### 初始化
 
-            **必须在对外开放端口前完成。** 此时 `POST /api/auth/register` 是公开的，
-            任何能访问该端口的人都能抢先注册管理员：
 
-            ```sh
-            curl -X POST http://<服务器IP>:3000/api/auth/register \
-              -H "Content-Type: application/json" \
-              -d '{"username":"admin","password":"admin123456","display_name":"系统管理员"}'
-            ```
+            从 **1.4.0** 起，全新部署走网页向导：打开
+            `http://<服务器IP>:3000/admin/setup`，填系统名称、监听地址与管理员
+            账号，点提交即可。向导会写好 `.env`、跑完迁移、建好管理员。
+
+
+            此前的方式是把 `POST /api/auth/register` 暴露在开放端口上、抢注一个
+            管理员。现在 SetupGate 中间件会在初始化完成前拦下除 `/api/setup/*`
+            与 `/api/health` 外的所有接口并返回 503，所以那条路已经堵上了。
+
+
+            已经初始化过的部署不受影响，向导会直接返回「已完成」。
+
+
+            > 首次初始化时请确认 `.env` 可写（向导需要写回配置），否则会返回
+            > 「当前进程无法写入 .env」。
+
 
             ## 本次构建的来源
 
