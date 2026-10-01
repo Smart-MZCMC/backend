@@ -9,15 +9,27 @@ import (
 
 	"smart-mzcmc/app/facades"
 	"smart-mzcmc/app/plugins"
+	"smart-mzcmc/app/setup"
 	"smart-mzcmc/app/ws"
 	"smart-mzcmc/bootstrap"
 )
 
 func main() {
+	// 初始化前置准备：补齐 .env 里的 APP_KEY / JWT_SECRET，并采样数据库
+	// 文件是否存在。必须放在最前面——框架在 config.NewApplication() 里
+	// 发现 APP_KEY 缺失或长度不对会直接 os.Exit(0)，那之前不做完，全新
+	// 部署连初始化向导页都起不来。
+	setup.Prepare()
+
 	// 补齐运行期目录。必须放在最前面——`migrate` 子命令也要用：
 	// 全新部署时 database/ 还不存在，SQLite 打不开文件，HasTable 会静默返回
 	// false，迁移就会「全部跳过」而不建任何表，之后服务起来了但表是空的。
 	ensureRuntimeDirs()
+
+	// 把「跑迁移」这件事注入 setup 包：迁移清单在 bootstrap 里，而
+	// bootstrap → routes → controllers 已经依赖 controllers，controllers
+	// 再反向 import bootstrap 就成环了。
+	setup.SetMigrator(runMigrations)
 
 	// `migrate` 子命令：只跑数据库迁移，不启动任何服务。
 	// Goravel 的 migrate 是 console 命令，而本项目没有接入 console kernel，

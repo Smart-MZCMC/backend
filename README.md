@@ -19,28 +19,36 @@ cd ../docs && pnpm install && pnpm run build:deploy
 
 # 3. 启动后端
 cd ../backend
-cp .env.example .env
+go run .
 ```
 
-`.env` 里至少需要设置：
+**不需要手工 `cp .env.example .env`。** 首次启动时 `app/setup` 会：
 
-```ini
-APP_PORT=3000
-JWT_SECRET=<换成你自己的密钥，留空会导致无法签发令牌>
-DB_CONNECTION=sqlite
-DB_DATABASE=database/smart-mzcmc.db
-```
+1. 在 `.env` 里补齐 `APP_KEY`、`JWT_SECRET`（各 32 位随机串），并把
+   `DB_CONNECTION` / `DB_DATABASE` 修成 SQLite（本项目只注册了 sqlite 驱动）；
+2. 发现数据库文件不存在时进入**初始化模式**：除 `/api/setup/*` 与 `/api/health`
+   外的 API 一律返回 503，`/` 直接 302 到 `/admin/setup`；
+3. 在 <http://127.0.0.1:3000/admin/setup> 的向导页填写系统名称、对外地址、
+   监听地址与端口、管理员账号，提交后写 `.env`、跑迁移、建第一个超级管理员。
 
 ```bash
 go run .                        # 开发运行
-go run . migrate                # 只跑数据库迁移，不启动服务
+go run . migrate                # 只跑数据库迁移，不启动服务（幂等）
 go build -o smart-mzcmc .       # 编译
 ```
+
+> 想完全手工初始化也可以：先 `cp .env.example .env` 并手工填 `JWT_SECRET`，
+> 再 `go run . migrate`，这样数据库文件先存在，后端不会进入初始化模式，
+> 之后用 `curl POST /api/auth/register` 建首个账号（用户表为空时自动成为超级管理员）。
 
 > Goravel 的 `migrate` 原本是 console 命令，但本项目没有接入 console kernel，
 > 所以 `main.go` 里直接遍历 `bootstrap.Migrations()` 调 `Up()`，并且**没有记账表**——
 > 所有迁移都必须写成幂等的（建表判 `HasTable`、清理用 `DELETE`）。
 > 新增迁移后记得在 `docs/development-guide.md` 的迁移表里补一行。
+
+> 注意 `app/setup` 是被 `config` 包**空导入**的，不能删（见 `config/setup.go` 的说明）：
+> Goravel 在配置初始化阶段就校验 `APP_KEY`，缺失直接 `os.Exit(0)`，
+> 写到 `main()` 里的准备代码根本执行不到。
 
 启动后：
 
@@ -137,19 +145,33 @@ CI 会把跨仓库的 admin / docs / interviewer 源码一并拉下来构建。
 | `POST` | `/api/auth/register` | 创建用户，**双模式**，见下方说明 |
 | `GET` | `/api/auth/bootstrap` | 是否还没有任何账号（供后台登录页切换表单） |
 | `GET` | `/api/status` | 服务状态与在线连接数 |
+| `GET` | `/api/setup/status` | 初始化状态与向导默认值，**初始化模式下也放行** |
+| `POST` | `/api/setup/apply` | 写 `.env` + 跑迁移 + 建首个超级管理员；已初始化后返回 403 |
 | `GET` | `/api/interview/:projectId` | 查询项目下采访点状态 |
 | `POST` | `/api/interview/status` | 采访端上报状态 |
 
+#### 初始化模式（`app/setup`）
+
+数据库文件不存在（或 `users` 表为空）时，除 `/api/setup/*` 与 `/api/health` 外的
+所有 API 都返回 503：
+
+```json
+{"code":"setup_required","error":"系统尚未初始化，请先完成初始化向导","setup_url":"/admin/setup"}
+```
+
+这是由 `routes/setupGate.go` 的全局中间件统一处理的，前端据此把浏览器送到
+`/admin/setup`（`/admin`、`/docs` 静态站点不受影响，否则向导页自己也打不开）。
+
 #### `POST /api/auth/register` 的双模式
 
-系统不预置账号。**用户表为空时，第一个注册的人自动成为管理员**，
+系统不预置账号。**用户表为空时，第一个注册的人自动成为超级管理员**，
 不需要登录态，也不需要额外密钥：
 
 ```bash
 curl -X POST http://localhost:3000/api/auth/register \
   -H "Content-Type: application/json" \
   -d '{"username":"admin","password":"admin123456","display_name":"系统管理员"}'
-# => 201 {"id":1,...,"role":"admin"}
+# => 201 {"id":1,...,"role":"super_admin"}
 ```
 
 第一个账号建好后，同一接口立刻切换为「仅管理员可调用」——管理后台的
@@ -157,8 +179,8 @@ curl -X POST http://localhost:3000/api/auth/register \
 
 | 系统状态 | 需要认证 | `role` 字段 |
 | :--- | :--- | :--- |
-| 用户表为空 | 否 | 被忽略，强制 `admin` |
-| 已有用户 | 需要 `admin` | 仅接受 `admin` / `director` |
+| 用户表为空 | 否 | 被忽略，强制 `super_admin` |
+| 已有用户 | 需要 `admin` | 仅接受不高于自己的角色 |
 
 参数约束：密码 ≥6 位；用户名 ≤64 字符，仅限字母、数字、`_`、`.`、`-`、中文。
 状态码：401 未登录、403 角色不足、400 参数不合法、409 用户名已存在。

@@ -39,6 +39,15 @@ func Web() {
 	healthController := controllers.NewHealthController()
 	facades.Route().Get("/api/health", healthController.Health)
 
+	// === 初始化向导（公开） ===
+	//
+	// 全新部署时数据库不存在，除这两个接口外的 API 都由 SetupGate 中间件
+	// 拦成 503 并把人引导到 /admin/setup。接口本身必须公开：此刻系统里
+	// 一个账号都没有，无从登录。
+	setupController := controllers.NewSetupController()
+	facades.Route().Get("/api/setup/status", setupController.Status)
+	facades.Route().Post("/api/setup/apply", setupController.Apply)
+
 	// === 认证路由（公开） ===
 	authController := controllers.NewAuthController()
 	facades.Route().Post("/api/auth/login", authController.Login)
