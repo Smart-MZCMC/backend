@@ -264,8 +264,46 @@ func (h *Hub) Run() {
 	}
 }
 
-// 连接速率限制：同一标识 1 秒内不允许重复连接
-var connectionRateLimit = make(map[string]time.Time)
+// 连接速率限制：同一标识 1 秒内不允许重复连接。
+//
+// 之前这是个裸的包级 map，每个 HTTP 处理 goroutine 都在直接读写它。
+// 多端同时重连（现场断一次电就是全部客户端一起冲）会让两个 goroutine
+// 并发写同一个 map，而 Go 的并发写 map 是 **fatal error**：不是 panic，
+// recover 拦不住，整个进程直接消失。现场表现是播到一半所有端同时断线、
+// 服务端进程没了，且日志里只有一行 maps.fatal，没有任何业务上下文。
+//
+// 键是 (project_id, role, point_code) 组合，所以还得顺手回收：项目一多、
+// 采访点一多，这个常驻 map 只会单调增长，而它没有任何人负责清理。
+var connectionRateLimit = struct {
+	mu   sync.Mutex
+	seen map[string]time.Time
+}{
+	seen: make(map[string]time.Time),
+}
+
+// allowConnection 决定这次连接是否放行，放行时记下当前时刻。
+//
+// 检查与写入必须在同一把锁里完成：分开锁的话两个并发重连会同时通过检查，
+// 限流等于没写。
+func allowConnection(key string) bool {
+	now := time.Now()
+
+	connectionRateLimit.mu.Lock()
+	defer connectionRateLimit.mu.Unlock()
+
+	// 顺带清掉过期项，保证 map 里只留最近一秒出现过的标识。
+	for k, at := range connectionRateLimit.seen {
+		if now.Sub(at) >= time.Second {
+			delete(connectionRateLimit.seen, k)
+		}
+	}
+
+	if last, ok := connectionRateLimit.seen[key]; ok && now.Sub(last) < time.Second {
+		return false
+	}
+	connectionRateLimit.seen[key] = now
+	return true
+}
 
 // isPrivilegedRole 判断连接角色是否属于必须持令牌的那几个。
 func isPrivilegedRole(role string) bool {
@@ -344,11 +382,10 @@ func HandleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 
 	// 速率限制：同一(project_id, role, point_code) 1秒内不重复
 	rateKey := strconv.Itoa(projectID) + ":" + role + ":" + pointCode
-	if last, ok := connectionRateLimit[rateKey]; ok && time.Since(last) < time.Second {
+	if !allowConnection(rateKey) {
 		http.Error(w, `{"error":"连接过于频繁"}`, http.StatusTooManyRequests)
 		return
 	}
-	connectionRateLimit[rateKey] = time.Now()
 
 	var userID uint
 	if userIDStr != "" {
