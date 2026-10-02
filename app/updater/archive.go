@@ -66,34 +66,65 @@ func lookupChecksum(checksums []byte, asset string) (string, bool) {
 	return "", false
 }
 
-// extractBinary 从 .tar.gz 中取出唯一名为 binaryName 的可执行文件，写到 dest。
+// extractArchive 从 .tar.gz 中取出白名单内的条目，整份解到 destRoot 下，
+// 返回实际解出了哪些白名单条目。
 //
-// 逐条路径都做了清洗：归档里的文件名是不可信输入，若直接 Join 到目标目录，
-// 一个名为 "../../etc/cron.d/x" 的条目就能写到目标之外（zip slip）。
-// 这里拒绝任何逃逸出目标目录的路径，并且只接受普通文件/目录，不处理符号链接
-// 与设备节点——发布包里不需要它们，接受了反而是攻击面。
-func extractBinary(archivePath, binaryName, dest string) error {
+// 白名单而不是「把包里除运行期目录外的东西全解出来」：发布包里带着
+// database/ 与 storage/ 的 .keep 占位，而这两个目录里是真实的数据库和日志。
+// 按目录名 blanket 解压迟早会踩到它们。
+//
+// want 里的每一条同时按「精确路径」和「目录前缀」匹配：写 `public/admin` 就能
+// 整份取出这个站点，写 `public/index.html` 就是取那个文件。两种解释并存不会
+// 误伤——归档里不存在 `public/index.html/xxx` 这种路径。
+//
+// stripFirstComponent 剥掉归档最外层的那个目录（tools/package.go 打的包全部条目
+// 都带一层 backend-linux-amd64/ 前缀），等价于 tar --strip-components=1。
+//
+// 同一个精确路径出现两次必须报错而不是后者覆盖前者：两个候选时无法确定用哪个，
+// 这和旧实现对可执行文件的处理一致。
+//
+// 路径清洗与体积上限沿用旧的那套：归档里的文件名是不可信输入，符号链接与设备
+// 节点一律拒绝，任何逃出 destRoot 的路径直接报错。
+func extractArchive(archivePath, destRoot string, want []string, match func(rel string) bool) (map[string]bool, error) {
 	f, err := os.Open(archivePath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer f.Close()
 
 	gz, err := gzip.NewReader(f)
 	if err != nil {
-		return fmt.Errorf("不是合法的 gzip 文件: %w", err)
+		return nil, fmt.Errorf("不是合法的 gzip 文件: %w", err)
 	}
 	defer gz.Close()
 
-	absDest, err := filepath.Abs(dest)
-	if err != nil {
-		return err
+	if err := os.MkdirAll(destRoot, 0o755); err != nil {
+		return nil, err
 	}
+	absRoot, err := filepath.Abs(destRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	found := make(map[string]bool, len(want))
+	written := make(map[string]bool, len(want))
+
+	// 白名单一律转成系统分隔符再比。归档里的路径经过 sanitizeEntryPath 之后
+	// 是系统形式（Windows 上是反斜杠），拿它去跟 "public/admin/" 这种写成
+	// 斜杠的字面量比前缀，在 Windows 上永远不成立——于是整个站点白名单会被
+	// 静默跳过，解出来只有一个可执行文件，正好回到这次要修的那个老毛病。
+	wantOS := make([]string, len(want))
+	origOf := make(map[string]string, len(want))
+	for i, w := range want {
+		wantOS[i] = filepath.FromSlash(w)
+		origOf[wantOS[i]] = w
+		found[w] = false
+	}
+	sep := string(filepath.Separator)
 
 	tr := tar.NewReader(gz)
 	var entries int
 	var total int64
-	var out *os.File
 
 	for {
 		hdr, err := tr.Next()
@@ -101,65 +132,111 @@ func extractBinary(archivePath, binaryName, dest string) error {
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("读取归档失败: %w", err)
+			return nil, fmt.Errorf("读取归档失败: %w", err)
 		}
 		entries++
 		if entries > maxEntries {
-			return fmt.Errorf("归档条目数超过上限 %d，疑似异常包", maxEntries)
+			return nil, fmt.Errorf("归档条目数超过上限 %d，疑似异常包", maxEntries)
 		}
 
 		switch hdr.Typeflag {
 		case tar.TypeSymlink, tar.TypeLink, tar.TypeChar, tar.TypeBlock, tar.TypeFifo:
-			return fmt.Errorf("归档包含非预期的条目类型 %q，已拒绝", string(hdr.Typeflag))
+			return nil, fmt.Errorf("归档包含非预期的条目类型 %q，已拒绝", string(hdr.Typeflag))
 		}
 
 		clean, err := sanitizeEntryPath(hdr.Name)
 		if err != nil {
-			return err
+			return nil, err
+		}
+		rel := stripFirstComponent(clean)
+		exact := false
+		under := false
+		for _, w := range wantOS {
+			if rel == w {
+				exact = true
+			}
+			if strings.HasPrefix(rel, w+sep) {
+				under = true
+			}
+		}
+		// 目录型目标只要底下有内容就算「解出来了」，不要求归档里带目录条目。
+		// tar 加不加目录头取决于打包器（tools/package.go 用 filepath.Walk，
+		// 恰好会写目录条目），把认领与否押在这上面太脆；而判错的后果是整个
+		// 站点被跳过、前端永远不更新——正是这次要修的那个毛病。
+		if exact || under {
+			for _, w := range wantOS {
+				if rel == w || strings.HasPrefix(rel, w+sep) {
+					found[origOf[w]] = true
+				}
+			}
 		}
 
 		if hdr.Typeflag == tar.TypeDir {
+			// 目录条目不用写盘：真正写文件时会 MkdirAll。
 			continue
 		}
 		if hdr.Typeflag != tar.TypeReg {
 			continue
 		}
+		if !exact && !under {
+			continue
+		}
+		if match != nil && !match(rel) {
+			continue
+		}
+		if exact {
+			if written[rel] {
+				return nil, fmt.Errorf("归档里有多个 %s，无法确定用哪个", rel)
+			}
+			written[rel] = true
+		}
+
+		// 再兜一次 dest：解出的路径必须仍在 destRoot 之内。
+		// sanitizeEntryPath 已经挡掉了 ..，这里是防止将来匹配逻辑改动时把
+		// 「相对根目录」当成「相对归档根目录」而静默写到别处。
+		outPath := filepath.Join(absRoot, rel)
+		if outPath != absRoot && !strings.HasPrefix(outPath, absRoot+sep) {
+			return nil, fmt.Errorf("归档条目解出后越界: %q", hdr.Name)
+		}
 
 		total += hdr.Size
 		if total > maxArtifactBytes {
-			return fmt.Errorf("归档解压后超过上限 %d 字节，疑似压缩炸弹", int64(maxArtifactBytes))
+			return nil, fmt.Errorf("归档解压后超过上限 %d 字节，疑似压缩炸弹", int64(maxArtifactBytes))
 		}
 
-		if filepath.Base(clean) != binaryName {
-			continue
+		if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+			return nil, err
 		}
-		if out != nil {
-			// 已经解出一个了，又出现同名文件。
-			//
-			// 这里必须先关掉前一个：句柄不关的话，在 Windows 上测试清理临时目录
-			// 会直接失败，在 Linux 上则一直泄漏到进程结束。
-			out.Close()
-			os.Remove(absDest)
-			return fmt.Errorf("归档里有多个 %s，无法确定用哪个", binaryName)
-		}
-
-		if out, err = os.Create(absDest); err != nil {
-			return err
+		out, err := os.Create(outPath)
+		if err != nil {
+			return nil, err
 		}
 		if _, err := io.Copy(out, io.LimitReader(tr, maxArtifactBytes)); err != nil {
 			out.Close()
-			os.Remove(absDest)
-			return err
+			os.Remove(outPath)
+			return nil, err
+		}
+		if err := out.Close(); err != nil {
+			os.Remove(outPath)
+			return nil, err
+		}
+		if exact {
+			found[origOf[rel]] = true
 		}
 	}
 
-	if out == nil {
-		return fmt.Errorf("归档包里没有找到 %s", binaryName)
+	return found, nil
+}
+
+// stripFirstComponent 去掉归档最外层目录。
+//
+// 路径只剩一个组件时原样返回：单文件的归档（例如测试夹具）不该被剥成空串。
+func stripFirstComponent(clean string) string {
+	parts := strings.Split(filepath.ToSlash(clean), "/")
+	if len(parts) < 2 {
+		return clean
 	}
-	if err := out.Close(); err != nil {
-		return err
-	}
-	return os.Chmod(absDest, 0o755)
+	return filepath.FromSlash(strings.Join(parts[1:], "/"))
 }
 
 // sanitizeEntryPath 清洗归档内的相对路径。

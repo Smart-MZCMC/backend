@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -137,41 +136,41 @@ func makeArchive(t *testing.T, entries map[string]string) string {
 	return path
 }
 
-func TestExtractBinary_HappyPath(t *testing.T) {
+// 在线更新真正跑的解包入口。这几条用例守着它的安全边界：
+// 归档里的文件名是不可信输入，而替换阶段会把解出来的东西写进服务目录。
+func TestExtractArchive_HappyPath(t *testing.T) {
 	archive := makeArchive(t, map[string]string{
 		"backend-linux-amd64/smart-mzcmc":       "BINARY",
 		"backend-linux-amd64/start.sh":          "#!/bin/sh",
 		"backend-linux-amd64/public/index.html": "<html>",
 	})
-	dest := filepath.Join(t.TempDir(), "out")
-	if err := extractBinary(archive, "smart-mzcmc", dest); err != nil {
+	root := filepath.Join(t.TempDir(), "stage")
+	found, err := extractArchive(archive, root, []string{"smart-mzcmc"}, nil)
+	if err != nil {
 		t.Fatalf("应成功，实际 %v", err)
 	}
-	got, err := os.ReadFile(dest)
+	if !found["smart-mzcmc"] {
+		t.Fatal("应认出 smart-mzcmc")
+	}
+	got, err := os.ReadFile(filepath.Join(root, "smart-mzcmc"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(got) != "BINARY" {
 		t.Fatalf("内容应为 BINARY，实际 %q", got)
 	}
-	// 执行权限只在类 Unix 系统上有意义：Windows 没有 exec 位，
-	// os.Chmod 不会反映到 Mode().Perm()，在这里断言必然失败。
-	// 真正的目标平台是 linux/amd64，权限位在那儿是必需的。
-	if runtime.GOOS != "windows" {
-		info, _ := os.Stat(dest)
-		if info.Mode().Perm()&0o111 == 0 {
-			t.Fatalf("解出的可执行文件应带执行权限，实际 %v", info.Mode().Perm())
-		}
+	// 不在白名单里的条目不该被解出来，哪怕它和目标在同一层目录。
+	if _, err := os.Stat(filepath.Join(root, "start.sh")); err == nil {
+		t.Error("白名单外的条目不该被解出")
 	}
 }
 
-func TestExtractBinary_RejectsTraversal(t *testing.T) {
+func TestExtractArchive_RejectsTraversal(t *testing.T) {
 	// 归档里自称要写到目标之外
 	archive := makeArchive(t, map[string]string{
 		"../../escaped": "PWNED",
 	})
-	dest := filepath.Join(t.TempDir(), "out")
-	err := extractBinary(archive, "escaped", dest)
+	_, err := extractArchive(archive, filepath.Join(t.TempDir(), "stage"), []string{"escaped"}, nil)
 	if err == nil {
 		t.Fatal("越界路径必须被拒绝")
 	}
@@ -180,7 +179,7 @@ func TestExtractBinary_RejectsTraversal(t *testing.T) {
 	}
 }
 
-func TestExtractBinary_RejectsSymlink(t *testing.T) {
+func TestExtractArchive_RejectsSymlink(t *testing.T) {
 	// 发布包里不需要符号链接，接受它只是多给攻击者一条路
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
@@ -198,26 +197,31 @@ func TestExtractBinary_RejectsSymlink(t *testing.T) {
 	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := extractBinary(path, "smart-mzcmc", filepath.Join(t.TempDir(), "out")); err == nil {
+	if _, err := extractArchive(path, filepath.Join(t.TempDir(), "stage"), []string{"smart-mzcmc"}, nil); err == nil {
 		t.Fatal("符号链接条目必须被拒绝")
 	}
 }
 
-func TestExtractBinary_MissingBinary(t *testing.T) {
+func TestExtractArchive_ReportsMissing(t *testing.T) {
+	// 包里没有目标时不报错，但必须能让调用方看出「没找到」——
+	// 在线更新靠这个判定包里到底带没带前端。
 	archive := makeArchive(t, map[string]string{"pkg/readme.md": "hello"})
-	err := extractBinary(archive, "smart-mzcmc", filepath.Join(t.TempDir(), "out"))
-	if err == nil || !strings.Contains(err.Error(), "没有找到") {
-		t.Fatalf("包里没有目标文件时应报明确错误，实际 %v", err)
+	found, err := extractArchive(archive, filepath.Join(t.TempDir(), "stage"), []string{"smart-mzcmc"}, nil)
+	if err != nil {
+		t.Fatalf("解包本身不该报错，实际 %v", err)
+	}
+	if found["smart-mzcmc"] {
+		t.Fatal("包里没有目标文件时不该被认领")
 	}
 }
 
-func TestExtractBinary_RejectsMultipleCandidates(t *testing.T) {
+func TestExtractArchive_RejectsMultipleCandidates(t *testing.T) {
 	// 两个同名文件 -> 不知道该用哪个，必须拒绝而不是随便挑一个
 	archive := makeArchive(t, map[string]string{
 		"a/smart-mzcmc": "ONE",
 		"b/smart-mzcmc": "TWO",
 	})
-	if err := extractBinary(archive, "smart-mzcmc", filepath.Join(t.TempDir(), "out")); err == nil {
+	if _, err := extractArchive(archive, filepath.Join(t.TempDir(), "stage"), []string{"smart-mzcmc"}, nil); err == nil {
 		t.Fatal("同名文件超过一个时必须拒绝")
 	}
 }

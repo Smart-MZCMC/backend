@@ -446,18 +446,44 @@ func (u *Updater) ApplyWithProgress(current, allowTarget, binaryName string, pro
 	}
 	step("sha256 校验通过 %s", sum[:16])
 
-	// 3. 解出可执行文件
-	stage(StageExtracting, "正在解压可执行文件…")
-	staged := filepath.Join(dir, binaryName+".new")
-	if err := extractBinary(archivePath, binaryName, staged); err != nil {
+	// 3. 解到暂存目录：可执行文件 + 三个静态站点 + 视图模板
+	stage(StageExtracting, "正在解压新版本…")
+	live, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	live, _ = filepath.EvalSymlinks(live)
+	root := filepath.Dir(live)
+
+	// 解压目标统一放在 update/stage 下，与最终部署目录同级——
+	// 跨文件系统 rename 会失败，同盘才保证替换是原子的。
+	stagingRoot := filepath.Join(dir, "stage")
+	if err := os.RemoveAll(stagingRoot); err != nil {
+		return nil, err
+	}
+
+	want := append([]string{binaryName}, deployTargets...)
+	want = append(want, deployFiles...)
+	found, err := extractArchive(archivePath, stagingRoot, want, nil)
+	if err != nil {
 		return nil, fmt.Errorf("解压失败: %w", err)
 	}
+	if !found[binaryName] {
+		return nil, fmt.Errorf("归档包里没有找到 %s", binaryName)
+	}
+
+	staged := filepath.Join(stagingRoot, binaryName)
 	arch, err := elfFingerprint(staged)
 	if err != nil {
-		os.Remove(staged)
 		return nil, fmt.Errorf("产物校验失败: %w", err)
 	}
 	step("已解出 %s（ELF %s）", binaryName, arch)
+
+	// 站点必须完整。包里声称带了某个站点、却没带 index.html，只能说明这个包
+	// 本身是坏的——此时继续下去会把现存的站点整份换掉、后台直接 404。
+	if err := verifyStagedSites(stagingRoot, found); err != nil {
+		return nil, err
+	}
 
 	res := &ApplyResult{
 		Version:    latest,
@@ -474,20 +500,53 @@ func (u *Updater) ApplyWithProgress(current, allowTarget, binaryName string, pro
 		// 这里刻意不设 StageFinished：终态（含 Finished/Failed 标志）由调用方
 		// 通过 FinishProgress / FailProgress 落。混着设会造出
 		//「stage=finished 但 finished=false」这种自相矛盾的进度，前端无从判断该不该停轮询。
-		step("新版本已就绪，未替换当前程序")
+		step("新版本已就绪，未替换当前程序；暂存目录 %s", stagingRoot)
 		return res, nil
 	}
 
-	// 4. 备份并替换
-	stage(StageReplacing, "正在备份并替换当前程序…")
-	live, err := os.Executable()
-	if err != nil {
-		return nil, err
+	// 4. 替换：先换站点，再换程序，最后跑迁移
+	//
+	// 顺序是有意的：站点是静态文件、替换失败只影响后台，而程序替换完还要跑
+	// 迁移。把可回滚的东西先换掉，最后一步失败时还能整体退回去。
+	stage(StageReplacing, "正在替换静态站点与当前程序…")
+
+	var pending []replaced
+	rollback := func(reason error) error {
+		for i := len(pending) - 1; i >= 0; i-- {
+			if err := pending[i].restore(root); err != nil {
+				// 回滚本身失败是最坏的情况：磁盘上可能既没有新版本也没有旧版本。
+				// 必须说出来，否则运维看到的只是一句「更新失败」。
+				return fmt.Errorf("%w；且回滚 %s 失败: %v", reason, pending[i].rel, err)
+			}
+		}
+		return reason
 	}
-	live, _ = filepath.EvalSymlinks(live)
+
+	for _, dir := range deployTargets {
+		if !found[dir] {
+			continue
+		}
+		if err := replaceDir(root, filepath.Join(stagingRoot, dir), dir); err != nil {
+			return nil, rollback(err)
+		}
+		pending = append(pending, replaced{rel: dir, kind: kindDir, backup: oldPathFor(root, dir)})
+		step("已替换 %s（整份换掉，不留上一版残渣）", dir)
+	}
+	for _, file := range deployFiles {
+		if !found[file] {
+			continue
+		}
+		if err := replaceFile(root, filepath.Join(stagingRoot, file), file); err != nil {
+			return nil, rollback(err)
+		}
+		pending = append(pending, replaced{rel: file, kind: kindFile, backup: oldPathFor(root, file)})
+		step("已替换 %s", file)
+	}
+
+	// 备份并替换可执行文件
 	backup := live + ".bak"
 	if err := copyFile(live, backup, 0o755); err != nil {
-		return nil, fmt.Errorf("备份当前程序失败: %w", err)
+		return nil, rollback(fmt.Errorf("备份当前程序失败: %w", err))
 	}
 	res.BackupPath = backup
 	step("已备份当前程序到 %s", backup)
@@ -495,13 +554,11 @@ func (u *Updater) ApplyWithProgress(current, allowTarget, binaryName string, pro
 	// 先写同目录临时文件再 rename：跨文件系统 rename 会失败，同目录则原子。
 	tmp := live + ".incoming"
 	if err := copyFile(staged, tmp, 0o755); err != nil {
-		return nil, err
+		return nil, rollback(err)
 	}
 	if err := os.Rename(tmp, live); err != nil {
 		os.Remove(tmp)
-		// 替换失败：把备份放回去，保证磁盘上始终有一个可运行的程序
-		copyFile(backup, live, 0o755)
-		return nil, fmt.Errorf("替换程序失败，已回滚: %w", err)
+		return nil, rollback(fmt.Errorf("替换程序失败，已回滚: %w", err))
 	}
 	res.Replaced = true
 	step("已替换为新版本 %s", latest)
@@ -510,15 +567,142 @@ func (u *Updater) ApplyWithProgress(current, allowTarget, binaryName string, pro
 	// systemd 拉起一个起不来的版本，故障就从「更新失败」变成「服务不可用」。
 	stage(StageMigrating, "正在执行数据库迁移…")
 	if err := u.runMigrate(live); err != nil {
-		copyFile(backup, live, 0o755)
-		return nil, fmt.Errorf("新版本数据库迁移失败，已回滚到备份版本，请检查迁移日志: %w", err)
+		if rerr := copyFile(backup, live, 0o755); rerr != nil {
+			return nil, fmt.Errorf("新版本数据库迁移失败: %w；且程序回滚失败: %v", err, rerr)
+		}
+		return nil, rollback(fmt.Errorf("新版本数据库迁移失败，已回滚到备份版本，请检查迁移日志: %w", err))
 	}
 	res.Migrated = true
 	step("数据库迁移成功")
 
+	// 6. 清理更新时留下的垃圾
+	//
+	// 下载的发布包（几十 MB）、.part、暂存目录、换下来的旧站点都在 update/ 下，
+	// 更新成功后它们没有任何用途，留着只会让下一轮更新反复多占一份磁盘。
+	// 备份的 live.bak 刻意留着：它是这一版出问题之后唯一的回退路径，
+	// 而它每次更新都会被同名覆盖，数量上不会累积。
+	if err := os.RemoveAll(dir); err != nil {
+		// 清理失败不影响更新结果，服务已经是新版本且跑得起来。
+		u.log("[Update] 清理暂存目录 %s 失败: %v", dir, err)
+		step("已更新，但暂存目录 %s 清理失败，可手工删除", dir)
+	} else {
+		step("已清理暂存目录 %s", dir)
+	}
+
 	res.Restart = "本进程即将退出，请由 systemd 自动拉起新版本。"
 	step("更新完成，服务即将重启")
 	return res, nil
+}
+
+// verifyStagedSites 检查暂存目录里被认领的站点是否完整。
+//
+// 「被认领」指发布包里确实带了该目录（extractArchive 的 found）。包里带了却
+// 缺 index.html 只能说明包本身坏了，此时必须拒绝整次更新：站点是整份换掉的，
+// 带着一份残缺的上去等于把能用的后台换成 404。
+//
+// 没被认领的站点直接跳过、保留现场那份——发布包不带前端时不该连累程序更新。
+func verifyStagedSites(stagingRoot string, found map[string]bool) error {
+	for _, rel := range deployTargets {
+		if !found[rel] {
+			continue
+		}
+		sentinel, ok := deploySentinels[rel]
+		if !ok {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(stagingRoot, filepath.FromSlash(rel), sentinel)); err != nil {
+			return fmt.Errorf("发布包里的 %s 缺少 %s，拒绝用残缺的站点覆盖现有版本", rel, sentinel)
+		}
+	}
+	return nil
+}
+
+// replaced 记录一次已完成的替换，用于迁移失败时回退。
+type replaced struct {
+	rel    string
+	kind   replaceKind
+	backup string
+}
+type replaceKind int
+
+const (
+	kindDir replaceKind = iota
+	kindFile
+)
+
+// oldPathFor 返回换下来的旧内容在 update/old 下的存放位置。
+func oldPathFor(root, rel string) string {
+	return filepath.Join(updateDir(root), "old", filepath.FromSlash(rel))
+}
+
+// replaceDir 把 staged 整份换到 root/rel：先把现有的挪到 backup，再把新的挪过来。
+//
+// 分两步 rename 而不是先删后拷：删完再拷，中间那一瞬目录是不存在的，
+// 而站点是由正在跑的服务按请求路径读的——那一下会 404。
+// 同盘 rename 是原子的，两步之间的窗口只剩一次 rename 的时间。
+func replaceDir(root, staged, rel string) error {
+	return swapIn(root, staged, rel, oldPathFor(root, rel), true)
+}
+
+func replaceFile(root, staged, rel string) error {
+	return swapIn(root, staged, rel, oldPathFor(root, rel), false)
+}
+
+// swapIn 是 replaceDir / replaceFile 的共同实现。
+func swapIn(root, staged, rel, backup string, isDir bool) error {
+	target := filepath.Join(root, filepath.FromSlash(rel))
+
+	if err := os.MkdirAll(filepath.Dir(backup), 0o755); err != nil {
+		return err
+	}
+	// 上一次失败可能留下了旧备份，先清掉，否则 rename 到已存在的路径行为不确定。
+	os.RemoveAll(backup)
+
+	hadOld := false
+	if _, err := os.Lstat(target); err == nil {
+		if err := os.Rename(target, backup); err != nil {
+			return fmt.Errorf("换下旧 %s 失败: %w", rel, err)
+		}
+		hadOld = true
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		if hadOld {
+			os.Rename(backup, target)
+		}
+		return err
+	}
+
+	var err error
+	if isDir {
+		err = os.Rename(staged, target)
+	} else {
+		err = copyFile(staged, target, 0o644)
+	}
+	if err != nil {
+		// 换上去失败就把旧的那份挪回来，不能留下一个空目录。
+		if hadOld {
+			os.Rename(backup, target)
+		}
+		return fmt.Errorf("换上新 %s 失败: %w", rel, err)
+	}
+	return nil
+}
+
+// restore 把 backup 挪回原位。backup 不存在说明原先那里就没有这份内容，
+// 此时只要把换上去的删掉。
+func (r replaced) restore(root string) error {
+	target := filepath.Join(root, filepath.FromSlash(r.rel))
+	if _, err := os.Lstat(r.backup); err == nil {
+		os.RemoveAll(target)
+		return os.Rename(r.backup, target)
+	}
+	if r.kind == kindDir {
+		return os.RemoveAll(target)
+	}
+	return os.Remove(target)
 }
 
 // runMigrate 用新二进制跑一次 migrate。
@@ -697,6 +881,40 @@ func copyFile(src, dst string, mode os.FileMode) error {
 		return err
 	}
 	return os.Rename(tmp, dst)
+}
+
+// deployTargets 是在线更新要替换的**目录**，相对可执行文件所在目录。
+//
+// 这三个静态站点此前完全不在更新范围内：发布包里带着它们，extractBinary 却只
+// 取可执行文件、其余全丢，于是后端升到新版、管理后台还跑在几个月前的 JS 上
+// （缓存头那侧的问题见 a8eb820，那是另一码事）。
+//
+// 站点目录要「先扬掉再整份拷入」而不是覆盖：SvelteKit / Vite 的产物文件名带
+// 内容哈希，覆盖只会让上一版的残渣逐版累积——仓库里曾攒到 140 个没有任何入口
+// 引用的旧文件，其中一个 public/admin/build/ 子目录还被当成第二份后台，
+// 以 /admin/build/ 暴露出去。整份换掉，这一类问题就整个不存在了。
+//
+// 刻意不含 database/ 与 storage/：包里只有 .keep 占位，而这两个目录里是真实的
+// 数据库与日志。也不含 start.sh / smart-mzcmc.service / .env.example——部署脚手架
+// 由现场维护，自动覆盖可能把改过路径的 systemd unit 冲掉。
+var deployTargets = []string{
+	"public/admin",
+	"public/docs",
+	"public/interviewer",
+	"resources",
+}
+
+// deployFiles 是在线更新要替换的**单文件**，同样相对可执行文件所在目录。
+var deployFiles = []string{
+	"public/index.html",
+}
+
+// 站点目录解出后必须存在的文件。缺了就说明这个包没带前端，直接拒绝更新——
+// 总比更新完只剩一个空目录、后台变成 404 强。
+var deploySentinels = map[string]string{
+	"public/admin":       "index.html",
+	"public/docs":        "index.html",
+	"public/interviewer": "index.html",
 }
 
 // updateDir 返回暂存目录：<程序所在目录>/update。
