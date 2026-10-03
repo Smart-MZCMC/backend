@@ -9,7 +9,7 @@ import (
 type StatusController struct{}
 
 // Version 当前后端版本号。会随发布手动同步，改动见 CHANGELOG。
-const Version = "1.5.1"
+const Version = "1.5.2"
 
 // MinClientVersion 是所有客户端都必须满足的最低适配版本。
 //
