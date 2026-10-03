@@ -112,6 +112,10 @@ func Web() {
 		systemController := controllers.NewSystemController()
 		r.Prefix("/api/system").Middleware(middleware.RequireRole(models.RoleSuperAdmin)).Group(func(sr route.Router) {
 			sr.Get("/info", systemController.Info)
+			// 运行指标（内存 / 磁盘 / 组件健康），供管理后台的监控页轮询。
+			// 与 /info 分开是因为轮询频率高得多：内存曲线要连续看，而运行环境
+			// 一次进来看一眼就够，混在一个接口里会把不必要的字段每 10 秒传一次。
+			sr.Get("/metrics", systemController.Metrics)
 			sr.Get("/update", systemController.UpdateStatus)
 			// 进度查询。更新跑在后台 goroutine 里，这个接口是它唯一的观察窗口。
 			sr.Get("/update/progress", systemController.UpdateProgress)
