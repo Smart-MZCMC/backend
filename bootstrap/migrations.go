@@ -1,10 +1,60 @@
 package bootstrap
 
 import (
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+
 	"github.com/goravel/framework/contracts/database/schema"
 
+	"smart-mzcmc/app/facades"
 	"smart-mzcmc/database/migrations"
 )
+
+// RunMigrations 依次执行所有已注册迁移。
+//
+// 每次启动都跑，不看是否执行过——所有迁移都写成幂等的（建表前判 HasTable、
+// 加字段前判 HasColumn、数据清理用 DELETE），重复执行安全。
+//
+// 放在 bootstrap 而不是 main：ORM 在 Build() 末尾才装配好，而自动迁移必须
+// 紧接着它跑（见 app.go 的 WithCallback），那时候 main 里的位置都已经过去了。
+func RunMigrations() error {
+	if err := ensureDatabaseDir(); err != nil {
+		return err
+	}
+	for _, m := range Migrations() {
+		log.Printf("[Migrate] 执行: %s", m.Signature())
+		if err := m.Up(); err != nil {
+			return fmt.Errorf("%s: %w", m.Signature(), err)
+		}
+	}
+	return nil
+}
+
+// ensureDatabaseDir 建出 SQLite 文件所在的目录。
+//
+// 为什么不靠 main.ensureRuntimeDirs：那个函数在 main 包里，而任何嵌入
+// bootstrap.Boot() 的调用方（测试、将来的运维工具）都不会经过 main，于是
+// SQLite 会报一句 "unable to open database file"——那句话里没有「目录不存在」
+// 这几个字，排查的人通常会先去查文件权限，而实际原因只是父目录压根没建。
+//
+// 目录建不出来不直接返回错误：那属于「磁盘满 / 路径不可写」，而下面第一条
+// 迁移会给出更具体的失败信息，这里再报一次只会把真正的原因往后挤。
+func ensureDatabaseDir() error {
+	path := facades.Config().GetString("database.connections.sqlite.database")
+	if path == "" {
+		return nil
+	}
+	dir := filepath.Dir(path)
+	if dir == "" || dir == "." {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Printf("[Migrate] 创建数据库目录 %s 失败（交给下面的迁移报错）: %v", dir, err)
+	}
+	return nil
+}
 
 func Migrations() []schema.Migration {
 	return []schema.Migration{

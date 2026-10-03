@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -40,18 +39,17 @@ func main() {
 	// 把「跑迁移」这件事注入 setup 包：迁移清单在 bootstrap 里，而
 	// bootstrap → routes → controllers 已经依赖 controllers，controllers
 	// 再反向 import bootstrap 就成环了。
-	setup.SetMigrator(runMigrations)
+	setup.SetMigrator(bootstrap.RunMigrations)
 
 	// `migrate` 子命令：只跑数据库迁移，不启动任何服务。
 	// Goravel 的 migrate 是 console 命令，而本项目没有接入 console kernel，
-	// 所以这里直接遍历 bootstrap.Migrations() 调 Up()。
-	// 所有迁移都写成幂等的（建表前判存在、数据清理用 DELETE），重复执行安全。
+	// 所以这里直接启动一次应用——bootstrap.Boot() 里的自动迁移（WithCallback）
+	// 会在这一刻把全部迁移跑完，跑不动的话那里已经 Fatalf 了。
+	// 保留这个子命令是为了「迁移到底跑成功没有」有一个能单独执行的答案：
+	// 自动迁移已经覆盖了正常运行路径，但线上排障时你需要一条不启动 Web 服务的命令。
 	if len(os.Args) > 1 && os.Args[1] == "migrate" {
 		app := bootstrap.Boot()
 		app.Boot()
-		if err := runMigrations(); err != nil {
-			log.Fatalf("迁移失败: %v", err)
-		}
 		log.Println("迁移完成")
 		return
 	}
@@ -98,17 +96,6 @@ func ensureRuntimeDirs() {
 			log.Printf("[启动] 创建目录 %s 失败: %v", dir, err)
 		}
 	}
-}
-
-// runMigrations 依次执行所有已注册迁移。
-func runMigrations() error {
-	for _, m := range bootstrap.Migrations() {
-		log.Printf("[Migrate] 执行: %s", m.Signature())
-		if err := m.Up(); err != nil {
-			return fmt.Errorf("%s: %w", m.Signature(), err)
-		}
-	}
-	return nil
 }
 
 // cleanupUpdateLeftovers 清掉 <程序目录>/update。
