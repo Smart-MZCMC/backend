@@ -75,8 +75,8 @@ func TestDecideRoleChange_DeniesSelfDemotion(t *testing.T) {
 // 后勤能删掉导播账号。这条是写测试时才发现的漏洞。
 func TestDecideRoleChange_RequiresAdminTier(t *testing.T) {
 	for _, actor := range []models.Role{
-		models.RoleLeader, models.RolePreProduction,
-		models.RoleLogistics, models.RoleDirector,
+		models.RoleLeader, models.RoleDirector, models.RolePackaging,
+		models.RoleCommentator, models.RolePreProduction, models.RoleLogistics,
 	} {
 		if err := decideRoleChange(user(1, actor), user(2, models.RoleDirector),
 			models.RoleLogistics); err == nil {
@@ -102,6 +102,9 @@ func TestDecideDeleteUser_Rules(t *testing.T) {
 		{"后勤删导播", models.RoleLogistics, models.RoleDirector, false},
 		{"前期删负责人", models.RolePreProduction, models.RoleLeader, false},
 		{"导播删导播", models.RoleDirector, models.RoleDirector, false},
+		// 后勤最低，删不动导播；反过来管理员删包装没问题。
+		{"管理员删包装", models.RoleAdmin, models.RolePackaging, true},
+		{"后勤删解说", models.RoleLogistics, models.RoleCommentator, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -120,8 +123,8 @@ func TestDecideDeleteUser_RequiresAdminTier(t *testing.T) {
 	// 等级高不代表能管人。下面这些角色都低于管理员，一律不得删账号，
 	// 哪怕对方比自己等级还低。
 	for _, actor := range []models.Role{
-		models.RoleLeader, models.RolePreProduction,
-		models.RoleLogistics, models.RoleDirector,
+		models.RoleLeader, models.RoleDirector, models.RolePackaging,
+		models.RoleCommentator, models.RolePreProduction, models.RoleLogistics,
 	} {
 		if err := decideDeleteUser(user(1, actor), user(2, models.RoleDirector)); err == nil {
 			t.Errorf("%s 删除导播账号：应拒绝（等级低于管理员）", actor)
@@ -144,13 +147,20 @@ func TestGuardGrant_MatchesRoleLevels(t *testing.T) {
 	}{
 		{models.RoleSuperAdmin, models.RoleSuperAdmin, true},
 		{models.RoleSuperAdmin, models.RoleDirector, true},
+		{models.RoleSuperAdmin, models.RoleLogistics, true},
 		{models.RoleAdmin, models.RoleAdmin, true},
 		{models.RoleAdmin, models.RoleDirector, true},
+		{models.RoleAdmin, models.RoleLogistics, true},
 		{models.RoleAdmin, models.RoleSuperAdmin, false},
 		{models.RoleLeader, models.RoleAdmin, false},
+		{models.RoleLeader, models.RoleDirector, true},
+		// 后勤是最低档，只能授予同为最低档的角色；反过来导播当然能。
 		{models.RoleLogistics, models.RoleLogistics, true},
-		{models.RoleLogistics, models.RoleDirector, true},
-		{models.RoleDirector, models.RoleLogistics, false},
+		{models.RoleLogistics, models.RoleDirector, false},
+		{models.RoleDirector, models.RoleLogistics, true},
+		// 包装 25 高于解说 20：包装端要切项目、读写本地配置，权限面更宽。
+		{models.RolePackaging, models.RoleCommentator, true},
+		{models.RoleCommentator, models.RolePackaging, false},
 	}
 	for _, c := range cases {
 		got := guardGrant(user(1, c.actor), c.grant)
@@ -160,15 +170,23 @@ func TestGuardGrant_MatchesRoleLevels(t *testing.T) {
 	}
 }
 
+// TestRoleLevelOrdering 钉死等级顺序。
+//
+// 注意有两条分开的链：commentator 与 pre_production 同为 20 级，
+// 它们之间不构成高低，所以不能塞进同一条严格递减的链里——否则这个用例会
+// 逼着人去把它们拆成两个等级，而那正是「解说要能做的前期也得能做」这条
+// 业务规则的倒退。相等的情形由 TestRoleCommentatorSharesLevelWithPreProduction
+// 单独断言。
 func TestRoleLevelOrdering(t *testing.T) {
-	// 等级顺序必须严格递减，否则中间件会放错人。
+	// 严格递减的部分：超管 > 管理员 > 负责人 > 导播 > 包装 > 解说/前期 > 后勤。
 	order := []models.Role{
 		models.RoleSuperAdmin,
 		models.RoleAdmin,
 		models.RoleLeader,
-		models.RolePreProduction,
-		models.RoleLogistics,
 		models.RoleDirector,
+		models.RolePackaging,
+		models.RoleCommentator,
+		models.RoleLogistics,
 	}
 	for i := 0; i+1 < len(order); i++ {
 		if order[i].Level() <= order[i+1].Level() {
@@ -181,6 +199,41 @@ func TestRoleLevelOrdering(t *testing.T) {
 		if order[i+1].AtLeast(order[i]) {
 			t.Errorf("%s 不应满足 AtLeast(%s)", order[i+1], order[i])
 		}
+	}
+}
+
+// TestRoleCommentatorSharesLevelWithPreProduction 防的是「把解说和前期拆成
+// 两个等级」这种看似无害的改动。它们同为 20 级是刻意的：两者都只订阅与展示，
+// 权限面一模一样，拆开只会凭空多出一道谁也说不清为什么的门。
+//
+// 反过来，等级相同**不代表角色相同**：AtLeast 在同等级上互为真，
+// 而角色名仍是两个不同的字符串，守卫要区分时得靠 Valid() 或白名单。
+func TestRoleCommentatorSharesLevelWithPreProduction(t *testing.T) {
+	if models.RoleCommentator == models.RolePreProduction {
+		t.Fatal("解说与前期必须是两个不同的角色，不能合并")
+	}
+	if models.RoleCommentator.Level() != models.RolePreProduction.Level() {
+		t.Fatalf("解说(%d) 与前期(%d) 应同为一级",
+			models.RoleCommentator.Level(), models.RolePreProduction.Level())
+	}
+	if models.RolePackaging.Level() == models.RoleCommentator.Level() {
+		t.Fatal("包装应比解说高一级：包装端要切项目、读写本地配置")
+	}
+	if !models.RoleCommentator.AtLeast(models.RolePreProduction) {
+		t.Error("同等级时 AtLeast 应互相成立")
+	}
+	if !models.RolePreProduction.AtLeast(models.RoleCommentator) {
+		t.Error("同等级时 AtLeast 应互相成立")
+	}
+	if !models.RolePackaging.AtLeast(models.RoleCommentator) {
+		t.Error("包装应满足解说的门槛")
+	}
+	if models.RoleCommentator.AtLeast(models.RolePackaging) {
+		t.Error("解说不应满足包装的门槛")
+	}
+	if !models.RoleDirector.AtLeast(models.RolePackaging) ||
+		!models.RoleDirector.AtLeast(models.RoleCommentator) {
+		t.Error("导播应同时满足包装与解说的门槛")
 	}
 }
 
@@ -224,5 +277,19 @@ func TestRoleSuperAdminGetsAdminRoutes(t *testing.T) {
 	}
 	if models.RoleDirector.AtLeast(models.RoleLeader) {
 		t.Fatal("导播不应具备负责人权限")
+	}
+	// 包装比解说高一级，导播比两者都高。反过来的方向必须逐个堵死，
+	// 否则任何一处 RequireRole(包装) 都会把解说端一起放进来。
+	if !models.RoleDirector.AtLeast(models.RolePackaging) {
+		t.Fatal("导播应高于包装")
+	}
+	if !models.RolePackaging.AtLeast(models.RoleCommentator) {
+		t.Fatal("包装应高于解说")
+	}
+	if models.RoleCommentator.AtLeast(models.RoleDirector) {
+		t.Fatal("解说不应具备导播权限")
+	}
+	if models.RoleLogistics.AtLeast(models.RoleCommentator) {
+		t.Fatal("后勤不应具备解说权限")
 	}
 }

@@ -101,13 +101,17 @@ func Jwt() contractshttp.Middleware {
 
 // RoleMiddleware 校验调用者是否达到最低角色等级。
 //
-// 为什么必须有：Jwt 中间件只验证令牌「是否有效」，不关心持有者是谁。
-// 少了这一层，任何登录用户（包括最低权限的导播）都能调管理接口。
+// ⚠️ routes/web.go 里已经**没有任何一条路由挂它**。接口准入改用
+// RequirePermission（app/rbac 的具名权限）。保留这个实现是因为它仍是一份
+// 「等级语义」的参考说明，而且删掉它会让「等级到底还能用在哪」失去唯一的
+// 实例。但**不要再往路由上挂新的等级门槛**：等级表达不了
+// 「负责人能看、不能改」，也表达不了「导播能抢锁、负责人不能」——这两种形状
+// 正是权限迁移要解决的问题。
 //
-// 语义是「等级 >= min」，不是「角色等于 min」。加超级管理员时这一点很关键：
-// 早期写法是对允许的角色名做等值比较，于是 RequireRole("admin") 并不放行
-// super_admin，每加一个更高角色都得回到每个调用点把名字补一遍——漏一处就是
-// 一个越权或误拒的入口。改成等级后，高角色自动继承低角色的接口访问权。
+// 为什么它当初存在：Jwt 中间件只验证令牌「是否有效」，不关心持有者是谁，
+// 少了第二层，任何登录用户（包括最低权限的导播）都能调管理接口。
+//
+// 语义是「等级 >= min」，不是「角色等于 min」。
 //
 // 注意：本文件所有中断响应都用 `Response().Json(...).Abort()` 链式写法。
 // 分成两行写（先 Json 再 ctx.Request().Abort()）会被 gin 重置成
@@ -167,6 +171,9 @@ func (m *RoleMiddleware) Handle(ctx contractshttp.Context) {
 //
 // 传入多个角色时取其中权限最低的一个作为门槛，例如
 // RequireRole(RoleAdmin, RoleLeader) 等价于 RequireRole(RoleLeader)。
+//
+// ⚠️ 别再用它做接口准入——用 RequirePermission。理由见 RoleMiddleware 的
+// 注释：等级表达不了「负责人能看、不能改」。
 func RequireRole(min ...models.Role) contractshttp.Middleware {
 	floor := models.RoleSuperAdmin
 	for _, r := range min {

@@ -36,9 +36,9 @@ func (m *ProjectMemberMiddleware) Handle(ctx contractshttp.Context) {
 		return
 	}
 
-	// 这里必须自己查库拿角色，不能依赖 RoleMiddleware 写进 ctx 的 "user"：
-	// 成员校验要挂在不止一条 RequireRole 路由上，锁接口那条路径上压根没有
-	// RoleMiddleware 跑过。
+	// 这里必须自己查库拿角色，不能依赖 RequirePermission / RequireRole 写进
+	// ctx 的 "user"：成员校验挂的那几条路由上，这两者压根没有跑过
+	// （成员校验就是它们的前一道门，不是一道更粗的门）。
 	var user models.User
 	if err := facades.Orm().Query().Select("id", "username", "role").
 		Where("id = ?", userID).First(&user); err != nil || user.ID == 0 {

@@ -15,8 +15,13 @@ import (
 // ProjectController 提供「非管理端」的项目视图。
 //
 // 存在的理由：导播端的项目下拉此前调的是 /api/admin/projects，而那条路由
-// 挂在 RequireRole(RoleAdmin) 之后——导播的令牌根本拿不到数据，下拉框恒定
+// 当时挂在「管理员及以上」之后——导播的令牌根本拿不到数据，下拉框恒定
 // 是空的。管理接口不该被非管理端复用。
+//
+// ⚠️ /api/admin/projects 现在要的是 project.view（全员持有，见 app/rbac），
+// 导播端调它也能拿到数据了。但**非管理端仍然该走这一组**：它按
+// user_projects 过滤出「我有权看的项目」，而 /api/admin/projects 是全量列表。
+// 两条接口的语义不一样，不是同一条路由的两个名字。
 type ProjectController struct{}
 
 func NewProjectController() *ProjectController {
@@ -26,8 +31,9 @@ func NewProjectController() *ProjectController {
 // actorForProjectList 取出当前登录用户。
 //
 // **不能用 actorFrom**：那个函数读的是 ctx 里的 "user"，而 "user" 是
-// RoleMiddleware 写进去的。这条路由只挂了 Jwt（任何人都能列自己有权看的
-// 项目），Jwt 只写 "user_id"，于是 actorFrom 会一律返回「未提供认证令牌」。
+// RequirePermission / RequireRole 写进去的。这条路由只挂了 Jwt（任何人都能
+// 列自己有权看的项目），Jwt 只写 "user_id"，于是 actorFrom 会一律返回
+// 「未提供认证令牌」。
 func actorForProjectList(ctx http.Context) (models.User, *authzError) {
 	userID, ok := ctx.Value("user_id").(uint)
 	if !ok || userID == 0 {

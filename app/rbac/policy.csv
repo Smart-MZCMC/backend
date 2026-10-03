@@ -1,0 +1,154 @@
+# 角色 → 权限 的唯一事实来源。
+#
+# 为什么策略在文件里而不是数据库：
+#   现场误配一个勾就把所有人锁在门外，而数据库里的策略没法在 code review 里
+#   审——它只有一条 UPDATE 记录，看不出「谁因此获得了什么」。策略文件是纯数据、
+#   可读、可评审，而且**没有任何数据迁移**：这个文件本身就是迁移结果。
+#   将来真要运行时可编辑（管理后台里给角色勾权限），把 app/rbac 里的
+#   stringadapter 换成 gorm 的 fileadapter 即可，路由声明那层一行都不用动。
+#
+# 为什么不用 g 继承：见 model.conf。显式清单一屏看完，「负责人到底能干什么」
+# 不用在脑子里推导继承链。漏补一行的后果是该角色少一项能力（安全侧），
+# 而不是某角色多一项能力（危险侧）。
+#
+# 格式：p, <角色>, <权限>。顺序按 models.AllRoles() 的权限从高到低排，
+#   角色名必须与 app/models/role.go 里的常量一字不差（app/rbac 的测试会扫）。
+#
+# ⚠️ 改这份文件前先读 app/rbac 的包注释三条设计约束。
+# ⚠️ 等级（models.Role.AtLeast）不再是路由准入的依据。「能不能进某个接口」
+#    看这里，「能不能操作某个人」看 controllers/authz.go 的 decideRoleChange
+#    与 decideDeleteUser——那是两件事，不要合并。
+
+# ── 读取 ────────────────────────────────────────────────────────────────────
+
+# log.view —— 查看协调日志。所有角色。
+# 导播、包装、解说、前期、后勤的工作界面都要看日志，缺任何一个都会让他们
+# 看不到现场到底发生了什么。管理员及以上同样持有，是为了让「日志只有部分
+# 人能看」这件事永远不成立。
+p, super_admin, log.view
+p, admin, log.view
+p, leader, log.view
+p, director, log.view
+p, packaging, log.view
+p, commentator, log.view
+p, pre_production, log.view
+p, logistics, log.view
+
+# project.view —— 看项目列表/详情/机位/切台记录/统计。所有角色。
+# 项目是全员工作的容器，没有人能拿到「不让我知道有哪些项目」这种限制。
+# 具体的某个项目能不能看，是另一层（ProjectMemberMiddleware + user_projects），
+# 别把两件事混在一张表里。
+p, super_admin, project.view
+p, admin, project.view
+p, leader, project.view
+p, director, project.view
+p, packaging, project.view
+p, commentator, project.view
+p, pre_production, project.view
+p, logistics, project.view
+
+# user.view —— 看用户列表。负责人及以上。
+# 负责人要给自己排班、要给新来的采访同学指派账号，必须能看到有哪些人。
+# 注意它与 user.manage 是**两行**：负责人能看，不能增删改角色。
+# 迁移前这道门是「管理员及以上」，于是负责人点开成员授权页是空的——他能
+# 管采访点、能授权成员，却连被授权的人是谁都看不到。
+p, super_admin, user.view
+p, admin, user.view
+p, leader, user.view
+
+# audit.view —— 看操作审计。管理员及以上。
+# 审计记录的是「谁能操作这套系统」，它是给管理员复盘用的，不是给被审计的人
+# 看的。负责人默认看不到自己动过的记录——真要看，走系统日志以外的手段。
+#
+# ⚠️ 这一项**刻意不是受保护权限**（已确认）。它是「能不能看」，不是「能不能
+#    维持系统可用」——放开或收紧它都只是多一个人看/少一个人看，出事时改回来
+#    很容易。把非受保护权限塞进受保护清单只会让在线编辑界面变成一大片灰色，
+#    而且没人说得清为什么。见 app/rbac/protect.go 的 protectedPermissions。
+p, super_admin, audit.view
+p, admin, audit.view
+
+# ── 会改动数据，但不致命 ──────────────────────────────────────────────────────
+
+# log.export —— 导出日志。负责人及以上。
+# 业务侧要看报表导出。导播与后勤用不到，而导出是能把整个项目历史拉走
+# （或落成文件带出系统）的动作，不该给到只读角色。
+p, super_admin, log.export
+p, admin, log.export
+p, leader, log.export
+
+# interview.manage —— 管理采访点。前期及以上。
+# 前期是素材与采访点准备的执行方，负责人管排期，管理员与超管兜底。
+# 导播/包装/解说/后勤不碰采访点：他们消费的是结果，不是采访点的编排。
+#
+# ⚠️ 目前没有任何路由挂这道门（后端还没有采访点的增删改接口）。先在策略里
+#    声明，是为了让将来加接口时权限已经存在、且必须被显式挂上；反过来
+#    「先加接口再补权限」的那几天里，这道门是不存在的。
+p, super_admin, interview.manage
+p, admin, interview.manage
+p, leader, interview.manage
+p, pre_production, interview.manage
+
+# project.member —— 授权/回收项目成员。负责人及以上。
+# ⚠️ 这一行是**权限迁移带来的行为变更**：迁移前是「管理员及以上」，也就是
+#    只有管理员与超管能给别人开项目。现在负责人也能。
+#    依据是业务要求——负责人管排期就必然要调整谁能上哪个项目；而
+#    REQUIRE_PROJECT_MEMBERSHIP 一旦打开，user_projects 就真的决定谁能读
+#    哪个项目，只让管理员改的话，负责人会天天去叫人代劳。
+#    注意它与 user.view 配套：负责人能授权，所以必须能看见被授权的人。
+p, super_admin, project.member
+p, admin, project.member
+p, leader, project.member
+
+# ── 会改变设备状态 ────────────────────────────────────────────────────────────
+
+# switch.operate —— 切台（acquire / release / heartbeat）。导播 + 管理员及以上。
+#
+# 这是**唯一一组不连续**的角色：导播(30)、管理员(50)、超管(60)，中间空着
+# 包装(25)与负责人(40)。等级门槛表达不了这个形状，也**不应该**用等级表达：
+# 负责人等级比导播高但按业务不参与导播工作，用 AtLeast(RoleDirector) 写这道
+# 门会直接把他放进来。
+# 管理员及以上保留，是给救场用的（切台锁卡死、导播端崩了没人接手），
+# 与 ProjectMemberMiddleware 里管理员绕过成员校验是同一套做法。
+#
+# ⚠️ 这一组**逐字替换**掉了迁移前的 RequireSwitchingOperator 白名单
+#    （CanOperateSwitching：导播 + AtLeast(管理员)）。两者集合相同，
+#    app/rbac 的矩阵测试与 routes 的挂载测试都钉住了这一点。
+#    只读的 GET /api/locks/:projectId/status 不挂这道门——所有人关心谁在控制。
+p, super_admin, switch.operate
+p, admin, switch.operate
+p, director, switch.operate
+
+# ── 会删数据 ──────────────────────────────────────────────────────────────────
+
+# log.cleanup —— 清理日志。管理员及以上。
+# 清理是真的删数据，而它删的正是审计线索本身。负责人没有理由做这件事，
+# 给他 log.export 就够了。
+p, super_admin, log.cleanup
+p, admin, log.cleanup
+
+# ── 会改动系统配置 ────────────────────────────────────────────────────────────
+
+# project.manage —— 建/改/删项目、机位预设增删改。管理员及以上。
+# 负责人管的是「人上哪个项目」，不是「有哪些项目」。建项目是系统管理员的活。
+p, super_admin, project.manage
+p, admin, project.manage
+
+# user.manage —— 增删账号、改角色。管理员及以上。
+# ⚠️ 「能进这个接口」不等于「能操作任何人」。改角色/删账号还必须过
+#    controllers/authz.go 的 decideRoleChange / decideDeleteUser：不能操作
+#    权限不低于自己的人、不能自降权、不能动最后一个超管。
+#    少掉那些判断的后果正是本项目踩过的坑：后勤能删掉导播账号。
+p, super_admin, user.manage
+p, admin, user.manage
+
+# system.maintain —— 系统信息/运行指标/在线更新。仅超级管理员。
+# 系统更新会替换服务自身的可执行文件并重启进程，任何一次误操作都会影响全系统
+# 所有客户端，所以它不与任何普通管理权限同级——是整个策略里唯一只有一行的权限。
+# ⚠️ 这一项是**受保护权限**（app/rbac/protect.go 的 protectedPermissions）：
+#    不可撤销，且只能授予受保护角色（super_admin）。
+#    这里的「只有一行」不是靠这句话保证的，而是靠 protect.go 的 ValidateGrant /
+#    ValidateRevoke —— 将来接在线编辑时，写入路径必须先问它们，否则第一个勾掉
+#    这一行的人会在当场把系统锁死，而且没有任何界面能改回来。
+# ⚠️ super_admin 本身也是**受保护角色**（protectedRoles），不可移除。它是上面
+#    那条规则的唯一受益者：没有它，这条规则照样成立却没人满足。
+p, super_admin, system.maintain

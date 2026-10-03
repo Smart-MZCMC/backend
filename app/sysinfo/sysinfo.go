@@ -117,7 +117,11 @@ type Database struct {
 	Driver    string `json:"driver"`
 	Path      string `json:"path"`
 	SizeBytes uint64 `json:"size_bytes"`
-	Ping      PingResult
+	// 标签不能漏：encoding/json 在字段没有 tag 时会**退回用字段名本身**，
+	// 于是接口会吐出一个 `"Ping"`（大写 P），而前端读的是 `ping`。
+	// 症状不是「字段空着」，而是监控页在 `metrics.database.ping.connected`
+	// 上直接抛 TypeError 整页崩掉——一个大小写之差，页面白屏。
+	Ping PingResult `json:"ping"`
 }
 
 // Component 单个组件的健康状态位。
@@ -253,7 +257,14 @@ func components(p Params, ping PingResult, disk Disk) []Component {
 			Name:    "api",
 			Status:  StatusRunning,
 			Version: p.Version,
-			Detail:  fmt.Sprintf("PID %d，工作目录 %s", os.Getpid(), p.DataDir),
+			// 这里给的是**数据目录**（库文件所在目录，也就是统计磁盘用量的那个目标），
+			// 不是进程的工作目录——后者在 Runtime.WorkingDir 里已经是绝对路径。
+			//
+			// 之前这一行写的是「工作目录 %s」而值传的是 DataDir，于是页面上出现
+			// 「PID 2975460，工作目录 database」这种自相矛盾的说法：值是个相对
+			// 数据目录，标签却声称它是工作目录。看监控的人会以为程序是从
+			// database/ 启动的。标签必须跟值对得上，否则比不写更糟。
+			Detail: fmt.Sprintf("PID %d，数据目录 %s", os.Getpid(), p.DataDir),
 		},
 		{Name: "database", Status: dbState, Detail: dbDetail, Version: ping.Version},
 		{Name: "storage", Status: diskState, Detail: diskDetail},

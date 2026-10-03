@@ -104,7 +104,19 @@ button { font: inherit; color: inherit; }
   ::selection { background: rgb(96 165 250 / 0.24); }
 }
 
+/*
+ * 隐藏优先于组件样式。页面里有几处用 hidden 属性切登录态与提示条，
+ * 而 .account-on / .dl-card 这类选择器的优先级高于浏览器默认的
+ * [hidden] { display:none }，不写这条就会「藏不住」。
+ */
+[hidden] { display: none !important; }
+
 .wrap { width: 100%; max-width: 1000px; margin: 0 auto; padding: 0 20px; }
+
+/* 锚点跳转的平滑滚动只给「没有要求减少动效」的人 */
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}
 
 /* ---------- 顶栏 ---------- */
 .topbar {
@@ -150,33 +162,39 @@ button { font: inherit; color: inherit; }
 .pill[data-state="down"] .dot { background: var(--error); }
 
 /* ---------- 主区 ---------- */
-main { flex: 1; padding: 48px 0 40px; }
+main { flex: 1; padding: 44px 0 40px; }
 
-.hero { text-align: center; margin-bottom: 36px; }
+.hero { text-align: center; margin-bottom: 32px; }
 .hero h1 {
-  font-size: clamp(24px, 4.2vw, 32px);
+  font-size: clamp(22px, 3.8vw, 30px);
   font-weight: 650;
   letter-spacing: -0.02em;
-  line-height: 1.25;
+  line-height: 1.35;
 }
 .hero p {
-  margin: 12px auto 0;
-  max-width: 560px;
+  margin: 14px auto 0;
+  max-width: 620px;
   font-size: 14px;
-  line-height: 1.7;
+  line-height: 1.75;
   color: var(--fg-muted);
 }
+/* 这排「chips」原本摆的是技术栈（Go / WebSocket / SQLite…），
+   对现场的人没有任何用处。现在改成页内目录——顺序必须与下面的区块一致，
+   编了号当步骤看却和实际排布对不上，比不给导航更让人懵。 */
 .chips { display: flex; justify-content: center; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
 .chip {
-  padding: 5px 12px;
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 14px;
   border: 1px solid var(--border);
   border-radius: 999px;
   background: var(--bg-surface);
-  font-size: 12px;
+  font-size: 12.5px;
   color: var(--fg-muted);
+  transition: border-color .15s, color .15s, background-color .15s;
 }
+a.chip:hover { border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); background: var(--primary-soft); color: var(--primary-ink); }
 
-/* ---------- 服务状态 ---------- */
+/* ---------- 区块标题 ---------- */
 .section-title {
   display: flex; align-items: center; gap: 8px;
   margin: 0 0 12px;
@@ -187,31 +205,112 @@ main { flex: 1; padding: 48px 0 40px; }
   color: var(--fg-faint);
 }
 .section-title::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+/* 标题下面那句「这一块是干什么的」——现场的人先看这句，再决定要不要读细节 */
+.section-lead { margin: -4px 0 14px; font-size: 13px; line-height: 1.75; color: var(--fg-muted); }
 
-.services { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-bottom: 36px; }
-.service {
-  display: flex; align-items: flex-start; gap: 12px;
-  padding: 16px;
+/* ---------- 账号面板 ---------- */
+.account {
+  padding: 18px 20px;
+  margin-bottom: 36px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--bg-surface);
   box-shadow: var(--shadow-panel);
 }
-.service .ico {
-  display: grid; place-items: center;
-  width: 34px; height: 34px; flex: none;
+.account-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; margin-top: 4px; }
+/* .section-lead 常规是「贴在标题下面的引子」，账号面板里那句是面板的第一句话 */
+.account .section-lead { margin: 0 0 12px; }
+.field { display: flex; flex-direction: column; gap: 5px; flex: 1 1 170px; min-width: 0; }
+.field span { font-size: 12px; color: var(--fg-muted); }
+.field input {
+  min-width: 0;
+  padding: 8px 11px;
+  border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--bg-overlay);
-  color: var(--fg-faint);
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
 }
-.service .txt { min-width: 0; flex: 1; }
-.service .name { display: flex; align-items: center; gap: 7px; font-size: 13.5px; font-weight: 600; }
-.service .addr { display: block; margin-top: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; line-height: 1.5; color: var(--fg-faint); overflow-wrap: anywhere; }
-.service .meta { display: block; margin-top: 5px; font-size: 11.5px; line-height: 1.5; color: var(--fg-muted); }
+.field input:focus-visible { border-color: var(--primary); background: var(--bg-surface); }
+.btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 8px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-overlay);
+  color: var(--fg);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background-color .15s, color .15s, border-color .15s;
+}
+.btn:hover { background: var(--bg-hover); border-color: var(--border-strong); }
+.btn-primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+.btn-primary:hover { background: var(--primary-ink); border-color: var(--primary-ink); color: #fff; }
+.btn[disabled] { opacity: .6; cursor: default; }
 
-.sdot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--fg-faint); }
-.sdot[data-state="ok"] { background: var(--success); }
-.sdot[data-state="down"] { background: var(--error); }
+.account-on { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 12px; }
+.who { font-size: 15px; font-weight: 600; }
+.who em { font-style: normal; font-weight: 400; color: var(--fg-muted); margin-left: 8px; font-size: 13.5px; }
+.account-on .btn { margin-left: auto; }
+.account-on .btn + .btn { margin-left: 0; }
+
+.account-msg { margin-top: 10px; font-size: 12.5px; line-height: 1.65; color: var(--fg-muted); }
+.account-msg[data-kind="error"] { color: var(--error-ink); }
+.account-msg[data-kind="warn"] { color: var(--warning-ink); }
+
+/* ---------- 客户端下载 ---------- */
+/* 230px 下限让 4 张卡在 1000px 容器里正好一行，不出现 3+1 的孤儿行 */
+.dl-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin-bottom: 36px; }
+.dl-card {
+  display: flex; flex-direction: column;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-panel);
+}
+.dl-card .ico {
+  display: grid; place-items: center;
+  width: 36px; height: 36px; flex: none;
+  margin-bottom: 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-overlay);
+  color: var(--primary-ink);
+}
+.dl-card h3 { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+.dl-card p { margin-top: 6px; font-size: 12.5px; line-height: 1.65; color: var(--fg-muted); }
+.dl-card p.hint { font-size: 11.5px; color: var(--warning-ink); }
+.dl {
+  margin-top: 14px;
+  display: flex; align-items: center; justify-content: center;
+  padding: 9px 12px;
+  border: 1px solid var(--primary);
+  border-radius: var(--radius-sm);
+  background: var(--primary);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 500;
+  text-align: center;
+  transition: background-color .15s, border-color .15s;
+}
+.dl:hover { background: var(--primary-ink); border-color: var(--primary-ink); }
+/* 版本号还没拿到时这个 <a> 不给 href —— 它那时根本不是链接，
+   既不会跳也不会被键盘聚焦。仅靠 pointer-events:none 拦不住这两件事，
+   而且那会让「正在获取版本…」看起来仍可点。 */
+.dl[aria-disabled="true"] { background: var(--bg-overlay); border-color: var(--border); color: var(--fg-faint); cursor: default; }
+.dl-file {
+  margin-top: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: var(--fg-faint);
+  overflow-wrap: anywhere;
+}
+/* 这一行只用来显示真实文件名。拿不到版本号时它没有内容，
+   此时不占空间——否则禁用按钮下方会挂一道孤零零的横线，
+   看着像排版坏了而不是「暂时没有」。 */
+.dl-file:empty { display: none; }
+.dl-alt { margin-top: 10px; font-size: 12.5px; line-height: 1.6; color: var(--primary-ink); text-decoration: underline; text-underline-offset: 3px; }
 
 /* ---------- 入口 ---------- */
 /* 210px 下限让 4 张卡在 1000px 容器里正好一行排满，不会出现 3+1 的孤儿行 */
@@ -246,38 +345,6 @@ main { flex: 1; padding: 48px 0 40px; }
 .nav-card .go { margin-top: 10px; font-size: 11.5px; color: var(--primary-ink); opacity: 0; transition: opacity .18s; }
 .nav-card:hover .go, .nav-card:focus-visible .go { opacity: 1; }
 
-/* ---------- 接入地址 ---------- */
-.endpoints { border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-surface); box-shadow: var(--shadow-panel); overflow: hidden; }
-.ep {
-  display: flex; align-items: center; gap: 12px;
-  padding: 11px 16px;
-  border-bottom: 1px solid var(--border);
-}
-.ep:last-child { border-bottom: 0; }
-.ep .k { flex: none; width: 96px; font-size: 12.5px; color: var(--fg-muted); }
-.ep .v {
-  flex: 1; min-width: 0;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 12px;
-  color: var(--fg);
-  overflow-wrap: anywhere;
-}
-.copy {
-  flex: none;
-  display: inline-flex; align-items: center; gap: 5px;
-  padding: 4px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg-overlay);
-  color: var(--fg-muted);
-  font-size: 11.5px;
-  cursor: pointer;
-  transition: background-color .15s, color .15s, border-color .15s;
-}
-.copy:hover { background: var(--bg-hover); color: var(--fg); border-color: var(--border-strong); }
-.copy[data-done="1"] { color: var(--success-ink); border-color: color-mix(in srgb, var(--success) 40%, var(--border)); background: var(--success-soft); }
-.ep-note { padding: 11px 16px; border-top: 1px solid var(--border); background: var(--bg-overlay); font-size: 11.5px; line-height: 1.7; color: var(--fg-faint); }
-
 /* ---------- 页脚 ---------- */
 footer { border-top: 1px solid var(--border); padding: 22px 0 30px; }
 footer .wrap { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; font-size: 12px; color: var(--fg-faint); }
@@ -288,10 +355,11 @@ footer .legal a:hover { color: var(--primary-ink); text-decoration: underline; }
 
 @media (max-width: 560px) {
   .brand span { display: none; }
-  .pill { padding: 5px 10px; }
-  .ep { flex-wrap: wrap; }
-  .ep .k { width: auto; }
-  .ep .v { flex-basis: 100%; order: 3; }
+  /* 状态提示语现在写得完整（小半句话），窄屏必须截断：
+     .pill 是 flex:none 且 nowrap，不截的话会把整条顶栏撑破。 */
+  .pill { padding: 5px 10px; max-width: 58vw; overflow: hidden; }
+  .pill #pillText { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .account-on .btn { margin-left: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -310,11 +378,11 @@ footer .legal a:hover { color: var(--primary-ink); text-decoration: underline; }
     </span>
     <span class="brand">
       <b>绵中融媒体智汇导播系统</b>
-      <span>校园直播导播协调平台</span>
+      <span>校园直播导播平台</span>
     </span>
     <span class="pill" id="pill" data-state="pending">
       <span class="dot"></span>
-      <span id="pillText">检测中…</span>
+      <span id="pillText">正在检查系统状态…</span>
     </span>
   </div>
 </div>
@@ -323,60 +391,108 @@ footer .legal a:hover { color: var(--primary-ink); text-decoration: underline; }
   <div class="wrap">
 
     <section class="hero">
-      <h1>导播预判、解说同步、包装联动，<br>一条链路全部留痕</h1>
-      <p>导播端切台时同时下发「当前播送」与「即将切台」，解说端与包装端各取所需；控制权互斥、采访点状态实时广播，全程日志可回溯。</p>
+      <h1>校园直播导播平台</h1>
+      <p>导播、解说、包装、采访四个岗位通过本系统协同工作：导播切换机位，其余各端
+        接收指令并按各自职责呈现。本页面提供三项内容——确认系统运行状态、下载各岗位
+        所需的客户端软件、以及登录管理后台。</p>
       <div class="chips">
-        <span class="chip">Go + Goravel</span>
-        <span class="chip">WebSocket</span>
-        <span class="chip">SQLite</span>
-        <span class="chip">JWT 鉴权</span>
-        <span class="chip">可插拔插件</span>
+        <a class="chip" href="#account">登录后台</a>
+        <a class="chip" href="#downloads">下载软件</a>
+        <a class="chip" href="#links">常用入口</a>
       </div>
     </section>
 
-    <h2 class="section-title">服务状态</h2>
-    <div class="services">
-      <div class="service">
-        <span class="ico" aria-hidden="true">
-          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><path d="M6 7h.01M6 17h.01"/>
-          </svg>
-        </span>
-        <span class="txt">
-          <span class="name">HTTP API <span class="sdot" id="d-api" data-state="pending"></span></span>
-          <span class="addr" id="a-api">—</span>
-          <span class="meta" id="m-api">管理后台与文档站的宿主进程</span>
-        </span>
+    <h2 class="section-title" id="account">登录后台</h2>
+    <div class="account">
+      <div id="accountAnon">
+        <p class="section-lead">管理后台用于账号与权限管理、项目配置、采访点状态维护及
+          操作日志查询。账号由系统管理员开通；在此登录后可直接进入后台。</p>
+        <form class="account-form" id="loginForm" autocomplete="off" novalidate>
+          <label class="field">
+            <span>账号</span>
+            <input id="loginUser" name="username" type="text" autocomplete="username" spellcheck="false" required>
+          </label>
+          <label class="field">
+            <span>密码</span>
+            <input id="loginPass" name="password" type="password" autocomplete="current-password" required>
+          </label>
+          <button class="btn btn-primary" id="loginBtn" type="submit">登录</button>
+        </form>
+        <p class="account-msg" id="loginMsg" role="status"></p>
       </div>
 
-      <div class="service">
-        <span class="ico" aria-hidden="true">
-          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M4 12a8 8 0 0 1 8-8"/><path d="M4 12a8 8 0 0 0 8 8"/><path d="M8 12a4 4 0 0 1 4-4"/><path d="M8 12a4 4 0 0 0 4 4"/><path d="M12 12h9"/>
-          </svg>
-        </span>
-        <span class="txt">
-          <span class="name">WebSocket Hub <span class="sdot" id="d-ws" data-state="pending"></span></span>
-          <span class="addr" id="a-ws">—</span>
-          <span class="meta" id="m-ws">实时指令与状态推送</span>
-        </span>
-      </div>
-
-      <div class="service">
-        <span class="ico" aria-hidden="true">
-          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M14.5 4h-5L8 7H4.5A1.5 1.5 0 0 0 3 8.5v10A1.5 1.5 0 0 0 4.5 20h15a1.5 1.5 0 0 0 1.5-1.5v-11A1.5 1.5 0 0 0 19.5 7H16z"/><circle cx="12" cy="13" r="3.2"/>
-          </svg>
-        </span>
-        <span class="txt">
-          <span class="name">采访端 Web <span class="sdot" id="d-interviewer" data-state="pending"></span></span>
-          <span class="addr" id="a-interviewer">—</span>
-          <span class="meta" id="m-interviewer">现场记者状态切换与保活</span>
-        </span>
+      <div id="accountOn" hidden>
+        <div class="account-on">
+          <span class="who"><span id="accountName">—</span><em id="accountRole"></em></span>
+          <a class="btn btn-primary" href="/admin" target="_blank" rel="noopener">进管理后台</a>
+          <button class="btn" id="logoutBtn" type="button">退出</button>
+        </div>
+        <p class="account-msg" id="accountNote" role="status"></p>
       </div>
     </div>
 
-    <h2 class="section-title">功能入口</h2>
+    <h2 class="section-title" id="downloads">下载软件</h2>
+    <p class="section-lead">四个岗位各对应一个客户端，请按本岗位下载。下载地址经由 GitHub
+      加速通道，可在网络条件受限的现场环境使用。</p>
+    <div class="dl-cards">
+
+      <div class="dl-card">
+        <span class="ico" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="5" y="2" width="14" height="20" rx="2.5"/><path d="M11 18.5h2"/>
+          </svg>
+        </span>
+        <h3>导播端</h3>
+        <p>供导播在直播过程中切换机位、下发指令使用，适用于 Android 平板，
+          下载后在平板上点击安装。</p>
+        <a class="dl" id="dl-director" role="link" aria-disabled="true">正在获取版本信息…</a>
+        <span class="dl-file" id="dlf-director">—</span>
+      </div>
+
+      <div class="dl-card">
+        <span class="ico" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14.5 4h-5L8 7H4.5A1.5 1.5 0 0 0 3 8.5v10A1.5 1.5 0 0 0 4.5 20h15a1.5 1.5 0 0 0 1.5-1.5v-11A1.5 1.5 0 0 0 19.5 7H16z"/><circle cx="12" cy="13" r="3.2"/>
+          </svg>
+        </span>
+        <h3>采访端</h3>
+        <p>供现场记者上报设备就绪状态使用。可在手机、平板或电脑上直接以浏览器
+          打开网页使用，亦可下载客户端安装。</p>
+        <a class="dl" id="dl-interviewer" role="link" aria-disabled="true">正在获取版本信息…</a>
+        <span class="dl-file" id="dlf-interviewer">—</span>
+        <a class="dl-alt" id="dl-web-interviewer" href="#">直接用浏览器打开采访端 →</a>
+        <p class="hint" id="interviewerHint" hidden></p>
+      </div>
+
+      <div class="dl-card">
+        <span class="ico" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3a3 3 0 0 1 3 3v5a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3z"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/>
+          </svg>
+        </span>
+        <h3>解说端</h3>
+        <p>供解说员查看播送标题与导播指令使用，适用于 Windows 电脑，下载后解压并
+          运行目录内的可执行文件。</p>
+        <a class="dl" id="dl-commentator" role="link" aria-disabled="true">正在获取版本信息…</a>
+        <span class="dl-file" id="dlf-commentator">—</span>
+      </div>
+
+      <div class="dl-card">
+        <span class="ico" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3 13l9 5 9-5"/>
+          </svg>
+        </span>
+        <h3>包装端</h3>
+        <p>供导播 B 与字幕员同步查看切台状态与内部消息使用，适用于 Windows 电脑，
+          下载后解压并运行目录内的可执行文件。</p>
+        <a class="dl" id="dl-packaging" role="link" aria-disabled="true">正在获取版本信息…</a>
+        <span class="dl-file" id="dlf-packaging">—</span>
+      </div>
+
+    </div>
+
+    <h2 class="section-title" id="links">常用入口</h2>
     <div class="nav-cards">
       <a class="nav-card" href="/admin">
         <span class="ico" aria-hidden="true">
@@ -385,7 +501,7 @@ footer .legal a:hover { color: var(--primary-ink); text-decoration: underline; }
           </svg>
         </span>
         <h3>管理后台</h3>
-        <p>用户管理、项目配置、权限分配、日志审计与插件状态</p>
+        <p>账号与权限管理、项目配置、采访点维护及操作日志查询</p>
         <span class="go">进入 →</span>
       </a>
 
@@ -395,8 +511,8 @@ footer .legal a:hover { color: var(--primary-ink); text-decoration: underline; }
             <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H19v15H6.5A2.5 2.5 0 0 0 4 20.5z"/><path d="M4 5.5v15"/><path d="M8.5 7.5h6.5M8.5 11h4.5"/>
           </svg>
         </span>
-        <h3>文档站</h3>
-        <p>操作手册、开发指南、通信协议与插件开发文档</p>
+        <h3>使用手册</h3>
+        <p>安装部署、设备连接、界面功能与通信协议说明</p>
         <span class="go">阅读 →</span>
       </a>
 
@@ -407,7 +523,7 @@ footer .legal a:hover { color: var(--primary-ink); text-decoration: underline; }
           </svg>
         </span>
         <h3>采访端</h3>
-        <p>浏览器直接打开，现场记者用大按钮切换就绪状态</p>
+        <p>现场记者使用的网页应用，手机或平板的浏览器打开即可使用，无需安装</p>
         <span class="go">打开 →</span>
       </a>
 
@@ -417,57 +533,25 @@ footer .legal a:hover { color: var(--primary-ink); text-decoration: underline; }
             <path d="M13 2 4.5 13.5H11l-1 8.5 8.5-11.5H12z"/>
           </svg>
         </span>
-        <h3>API 状态</h3>
-        <p>查看原始 JSON：服务状态、在线连接数、版本号</p>
+        <h3>运行状态（JSON）</h3>
+        <p>供技术人员排障使用：系统状态、在线客户端数量、当前版本</p>
         <span class="go">查看 →</span>
       </a>
     </div>
 
-    <h2 class="section-title">接入地址</h2>
-    <div class="endpoints">
-      <div class="ep">
-        <span class="k">HTTP API</span>
-        <span class="v" id="ep-api">—</span>
-        <button class="copy" type="button" data-copy="ep-api">复制</button>
-      </div>
-      <div class="ep">
-        <span class="k">WebSocket</span>
-        <span class="v" id="ep-ws">—</span>
-        <button class="copy" type="button" data-copy="ep-ws">复制</button>
-      </div>
-      <div class="ep">
-        <span class="k">管理后台</span>
-        <span class="v" id="ep-admin">—</span>
-        <button class="copy" type="button" data-copy="ep-admin">复制</button>
-      </div>
-      <div class="ep">
-        <span class="k">采访端</span>
-        <span class="v" id="ep-interviewer">—</span>
-        <button class="copy" type="button" data-copy="ep-interviewer">复制</button>
-      </div>
-      <div class="ep-note">
-        解说端与包装端只需在 exe 同目录的 <code>config.json</code> 里改 <code>WsUrl</code> 一项，
-        <code>Role</code> 分别写 <code>commentator</code> / <code>packaging</code>，<code>ProjectId</code> 填目标项目。
-        采访端改 <code>public/interviewer/config.json</code> 的 <code>wsUrl</code>，刷新浏览器即可，都不需要重新编译。
-        <br />
-        页面已自动识别是否经过反向代理：能同源访问 <code>/ws/status</code> 就用同源地址，
-        否则退回 <code>:3002</code> 直连。用 <code>?wsport=端口</code> 可强制走直连并指定端口。
-      </div>
     </div>
-
-  </div>
 </main>
 
 <footer>
   <div class="wrap">
     <span>绵中融媒体智汇导播系统</span>
     <span class="sep">·</span>
-    <span>Go 1.25 + Goravel + SQLite + WebSocket</span>
-    <span class="sep">·</span>
-    <span id="f-version">—</span>
+    <span>服务器版本 <span id="f-version">—</span></span>
   </div>
   <div class="wrap legal">
     <span>Copyright © <span id="f-year">2026</span> 烧瑚烙饼 版权所有</span>
+    <span class="sep">·</span>
+    <span>Go 1.25 + Goravel + SQLite + WebSocket</span>
     <span class="sep">·</span>
     <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener nofollow">蜀ICP备2025120814号-1</a>
   </div>
@@ -484,7 +568,7 @@ footer .legal a:hover { color: var(--primary-ink); text-decoration: underline; }
   //     需要跨端口探 http://<host>:3002/ws/status。
   //  B. 反向代理（生产，走 zhdb.647382.xyz 这类域名）：nginx 把 /ws、
   //     /interviewer/ 都转到了 3002。此时 3002 只监听 127.0.0.1，
-  //     公网根本连不上——如果还去探 :3002 就会误报「WebSocket 不可达」。
+  //     公网根本连不上——如果还去探 :3002 就会误报「实时通道不通」。
   //
   // 所以策略是「同源优先，失败再退回 :3002」：
   // 探同源 /ws/status，成功就说明是反代形态，地址也用同源；
@@ -533,29 +617,101 @@ footer .legal a:hover { color: var(--primary-ink); text-decoration: underline; }
   }
 
   function paint() {
-    set('a-api', apiBase);
-    set('a-ws', resolved.ws);
-    set('a-interviewer', resolved.interviewer);
-    set('ep-api', apiBase);
-    set('ep-ws', resolved.ws);
-    set('ep-admin', apiBase + '/admin');
-    set('ep-interviewer', resolved.interviewer);
+    // 页面上的「接入地址」区块已移除，现在只剩采访端那两处入口需要
+    // 这个地址：常用入口里的采访端卡、下载区里的「直接用浏览器打开」。
     var card = document.getElementById('card-interviewer');
     if (card) card.href = resolved.interviewer;
+    var web = document.getElementById('dl-web-interviewer');
+    if (web) web.href = resolved.interviewer;
   }
 
   useDirect();
   document.getElementById('f-year').textContent = String(new Date().getFullYear());
 
+  // ---- 客户端下载 ------------------------------------------------------
+  //
+  // 链接走镜像前缀而不是直连 github.com：现场的网络环境访问 GitHub
+  // 经常时好时坏，直接给原始地址等于让人点开之后干瞪眼。
+  var GITHUB_MIRROR = 'https://gh-proxy.com/';
+
+  // 资产名不是随手编的，它由三个 release.yml 各自决定：
+  // 两个 APK 由后端仓库的发布流程产出并挂在 Smart-MZCMC/backend 的
+  // Release 上，两个 zip 由各自仓库产出。改了流水线的产物名这里必须跟着改，
+  // 否则现场点下去是 404，而且要等到发版那天才发现。
+  var DOWNLOADS = [
+    { key: 'director', repo: 'backend', prefix: 'director-', suffix: '.apk', cta: '下载安装包' },
+    { key: 'interviewer', repo: 'backend', prefix: 'interviewer-', suffix: '.apk', cta: '下载安装包' },
+    { key: 'commentator', repo: 'commentator', prefix: 'commentator-', suffix: '-win-x64.zip', cta: '下载并解压' },
+    { key: 'packaging', repo: 'packaging', prefix: 'packaging-', suffix: '-win-x64.zip', cta: '下载并解压' }
+  ];
+
+  // 版本号只认 <主>.<次>.<修订>，且必须整串匹配。
+  // 它是 /api/status 的返回值，直接拼进 URL 等于让一个接口能往链接里塞
+  // 任意字符——尾部不加 $ 的话，"1.6.0/x" 这类值照样能拼出一条看起来
+  // 正常、点下去却指向别处的链接。
+  function versionOk(ver) {
+    return /^[0-9]+\.[0-9]+\.[0-9]+$/.test(ver);
+  }
+  function assetName(spec, ver) {
+    return spec.prefix + ver + spec.suffix;
+  }
+  function downloadUrl(spec, ver) {
+    return GITHUB_MIRROR + 'https://github.com/Smart-MZCMC/' + spec.repo +
+           '/releases/download/v' + ver + '/' + assetName(spec, ver);
+  }
+
+  // 上一次画成什么样。探活每 10 秒跑一次，不去重的话每轮都会重写一遍
+  // href —— 有人正按着这个链接时，它会在指下变一次。
+  var dlPainted = '';
+
+  function paintDownloads() {
+    var ver = state.version || '';
+    var key = ver + '|' + (state.probed ? (state.api ? '1' : '0') : '?');
+    if (key === dlPainted) return;
+    dlPainted = key;
+
+    var ready = versionOk(ver);
+    DOWNLOADS.forEach(function (spec) {
+      var link = document.getElementById('dl-' + spec.key);
+      if (!link) return;
+      var file = document.getElementById('dlf-' + spec.key);
+
+      if (ready) {
+        var name = assetName(spec, ver);
+        link.setAttribute('href', downloadUrl(spec, ver));
+        link.removeAttribute('aria-disabled');
+        link.textContent = spec.cta;
+        if (file) file.textContent = name;
+        return;
+      }
+
+      // 没拿到版本号之前绝不拼链接：编一个看起来能点的地址，
+      // 现场点下去 404，比一开始就说「正在获取」糟糕得多。
+      link.removeAttribute('href');
+      link.setAttribute('aria-disabled', 'true');
+      link.textContent = state.probed ? '未能获取版本号，请刷新页面重试' : '正在获取版本信息…';
+      // 清空而不是填一个破折号：这一行只用来显示真实文件名，
+      // 拿不到版本号时它没有内容可显示。留个「—」占位会在禁用按钮
+      // 下方挂一道孤零零的横线，看起来像排版坏了而不是「暂时没有」。
+      // .dl-file:empty { display: none } 负责不占空间。
+      if (file) file.textContent = '';
+    });
+  }
+
+  // 采访端网页版没部署到服务器上时给出提示。以前这句话在探针卡上，
+  // 卡删掉之后如果不说，现场点了采访端会看到一片空白而不知道原因。
+  function paintInterviewerHint() {
+    var hint = document.getElementById('interviewerHint');
+    if (!hint) return;
+    var missing = state.ws && !state.interviewer;
+    hint.hidden = !missing;
+    if (missing) hint.textContent = '网页版还没装到这台服务器上，先用上面的安装包。';
+  }
+
   // ---- 状态探测 --------------------------------------------------------
   // HTTP API 与 WebSocket 是两个独立进程：只探 /api/status 的话，
-  // WS 挂了页面仍会显示「服务在线」。所以两个都探，合计判断。
-  var state = { api: false, ws: false, interviewer: false, online: 0, version: '' };
-
-  function setDot(id, ok) {
-    var el = document.getElementById(id);
-    if (el) el.setAttribute('data-state', ok ? 'ok' : 'down');
-  }
+  // 实时通道挂了页面仍会显示「一切正常」。所以两个都探，合计判断。
+  var state = { api: false, ws: false, interviewer: false, online: 0, version: '', probed: false };
 
   function withTimeout(promise, ms) {
     return new Promise(function (resolve, reject) {
@@ -583,24 +739,24 @@ footer .legal a:hover { color: var(--primary-ink); text-decoration: underline; }
         state.api = true;
         state.online = Number(d.online_count) || 0;
         state.version = d.version || '';
-        setDot('d-api', true);
-        set('m-api', '在线连接 ' + state.online + ' 个 · v' + (state.version || '?'));
+        state.probed = true;
         set('f-version', state.version ? 'v' + state.version : '');
+        paintDownloads();
       })
       .catch(function () {
         state.api = false;
-        setDot('d-api', false);
-        set('m-api', '无法连接 · 管理后台可能不可用');
+        state.probed = true;
+        paintDownloads();
       })
       .then(function () {
-        // 2) WebSocket Hub：同源优先，失败再退回直连端口。
+        // 2) 实时通道：同源优先，失败再退回直连端口。
         //
         // /ws/status 带 CORS 头，跨端口也能读 body；采访端是否已部署
         // 也由它回报——3002 上的静态处理器不带 CORS 头，从 3000 直接
         // fetch 采访端页面会被浏览器拦掉，探测结果不可信。
         //
         // 顺序很关键：反代部署时 3002 只监听 127.0.0.1，先探它必然失败，
-        // 会把一切正常的部署误报成「WebSocket 不可达」。
+        // 会把一切正常的部署误报成「实时通道不通」。
         var order = forceDirect
           ? [{ proxy: false }, { proxy: true }]
           : [{ proxy: true }, { proxy: false }];
@@ -632,26 +788,26 @@ footer .legal a:hover { color: var(--primary-ink); text-decoration: underline; }
         return attempt(0);
       })
       .then(function () {
-        setDot('d-ws', state.ws);
-        set('m-ws', state.ws ? '实时指令通道已就绪' : '无法连接 · 各端将持续重连');
-
-        setDot('d-interviewer', state.ws && state.interviewer);
-        set('m-interviewer',
-          !state.ws ? '随 WebSocket 不可达'
-                    : (state.interviewer ? '浏览器可直接打开' : '未部署产物 · 需 flutter build web'));
+        paintInterviewerHint();
       })
       .then(function () {
+        // 顶栏那颗灯是整页唯一的系统健康提示，所以文案要说清「哪里不通」：
+        // 笼统一句「服务异常」会让人不知道该找网络还是该找管理员。
         var pill = document.getElementById('pill');
         var text = document.getElementById('pillText');
         if (state.api && state.ws) {
           pill.setAttribute('data-state', 'ok');
-          text.textContent = '全部在线 · ' + state.online + ' 个连接';
+          text.textContent = '系统运行正常 · 在线客户端 ' + state.online + ' 个';
         } else if (state.api || state.ws) {
           pill.setAttribute('data-state', 'warn');
-          text.textContent = state.api ? 'WebSocket 不可达' : 'WebSocket Hub 未启动';
+          // 两项只通其一时要说清是哪一项不通：客户端能否连上取决于实时通道，
+          // 而后台能否打开取决于 HTTP 接口，二者的处置方式并不相同。
+          text.textContent = state.api
+            ? '实时通道不可用，客户端将持续重连'
+            : '管理后台不可用';
         } else {
           pill.setAttribute('data-state', 'down');
-          text.textContent = '服务不可用';
+          text.textContent = '服务未启动，请联系系统管理员';
         }
       });
   }
@@ -659,45 +815,189 @@ footer .legal a:hover { color: var(--primary-ink); text-decoration: underline; }
   check();
   setInterval(check, 10000);
 
-  // ---- 复制 ------------------------------------------------------------
-  // navigator.clipboard 只在 https / localhost 下可用，
-  // 局域网 http 访问时会直接不存在，所以留 execCommand 兜底。
-  function legacyCopy(text) {
-    var ta = document.createElement('textarea');
-    ta.value = text;
-    ta.setAttribute('readonly', '');
-    ta.style.cssText = 'position:fixed;top:-1000px;opacity:0';
-    document.body.appendChild(ta);
-    ta.select();
-    var ok = false;
-    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
-    document.body.removeChild(ta);
-    return ok;
+  // ---- 账号面板 --------------------------------------------------------
+  //
+  // 令牌只放 sessionStorage，不放 localStorage。
+  // 这一页会被转发出去（导播把地址发到工作群里，谁点开都落到「访问这台机器
+  // 的人的浏览器」），localStorage 会把一个能进后台的令牌留在共享电脑的磁盘上，
+  // 下一个用到这台机器的人就是那个人。sessionStorage 关掉标签页即失效，
+  // 刷新还在——现场调试时正好够用，又不留痕。
+  var TOKEN_KEY = 'mzcmc.index.token';
+  var USER_KEY = 'mzcmc.index.user';
+  var token = readSession(TOKEN_KEY);
+
+  // 浏览器禁用存储时（无痕模式、企业策略）读写 sessionStorage 会抛异常，
+  // 不兜住的话整个脚本在第一行就死了，连状态灯都不再刷新。
+  function readSession(key) {
+    try { return sessionStorage.getItem(key) || ''; } catch (e) { return ''; }
+  }
+  function writeSession(key, value) {
+    try { sessionStorage.setItem(key, value); } catch (e) { /* 存不下就退化成「本次有效」 */ }
+  }
+  function dropSession(key) {
+    try { sessionStorage.removeItem(key); } catch (e) { /* 同上 */ }
   }
 
-  document.addEventListener('click', function (event) {
-    var btn = event.target.closest ? event.target.closest('.copy') : null;
-    if (!btn) return;
+  var elAnon = document.getElementById('accountAnon');
+  var elOn = document.getElementById('accountOn');
+  var elMsg = document.getElementById('loginMsg');
+  var elNote = document.getElementById('accountNote');
+  var elUser = document.getElementById('loginUser');
+  var elPass = document.getElementById('loginPass');
+  var elBtn = document.getElementById('loginBtn');
 
-    var target = document.getElementById(btn.getAttribute('data-copy'));
-    if (!target) return;
-    var text = target.textContent.trim();
-
-    var done = function (ok) {
-      btn.textContent = ok ? '已复制' : '复制失败';
-      btn.setAttribute('data-done', ok ? '1' : '0');
-      setTimeout(function () {
-        btn.textContent = '复制';
-        btn.removeAttribute('data-done');
-      }, 1600);
-    };
-
-    if (navigator.clipboard && window.isSecureContext) {
-      navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(legacyCopy(text)); });
-    } else {
-      done(legacyCopy(text));
+  function showLogin(message) {
+    if (elAnon) elAnon.hidden = false;
+    if (elOn) elOn.hidden = true;
+    if (elMsg) {
+      elMsg.textContent = message || '';
+      elMsg.setAttribute('data-kind', message ? 'error' : 'idle');
     }
-  });
+  }
+
+  function showSession(user, note) {
+    if (elAnon) elAnon.hidden = true;
+    if (elOn) elOn.hidden = false;
+
+    var name = document.getElementById('accountName');
+    var role = document.getElementById('accountRole');
+    // 角色中文名用后端给的 role_label，不在前端自己维护一张角色表——
+    // 加新角色时那种表必然漏改，会把新角色显示成错的。拿不到才退回原始值。
+    var label = (user && user.role_label) || (user && user.role) || '';
+    if (name) name.textContent = (user && user.username) || '已登录';
+    if (role) role.textContent = label;
+
+    if (elNote) {
+      elNote.textContent = note || '本页登录状态仅在当前标签页有效；进入管理后台时需再次验证身份。';
+      elNote.setAttribute('data-kind', note ? 'warn' : 'idle');
+    }
+  }
+
+  // 令牌失效时清干净并明确告诉用户「是过期了」。
+  // 静默退回登录框会让人以为是自己莫名其妙登出了，于是反复输密码。
+  function expireSession() {
+    token = '';
+    dropSession(TOKEN_KEY);
+    dropSession(USER_KEY);
+    showLogin('登录已过期，请重新登录。');
+  }
+
+  // 只在「带着令牌发出的请求」上把 401 当成过期处理。
+  // 登录接口本身也用 401 表示「用户名或密码错误」（见 auth_controller.go），
+  // 那条路径必须把后端的 error 原文显示出来，不能把人踢回登录框。
+  function authFetch(url, options) {
+    if (!token) return fetch(url, options);
+    return fetch(url, options).then(function (r) {
+      if (r.status === 401) expireSession();
+      return r;
+    });
+  }
+
+  // 后端的错误体固定是 {"error": "可读文案"}，但不能假设一定有：
+  // 反代拦截、网关报错时 body 是 HTML 或者是空的。取不到就退回状态码。
+  function readJson(response) {
+    return response.text().then(function (text) {
+      if (!text) return null;
+      try { return JSON.parse(text); } catch (e) { return null; }
+    });
+  }
+
+  // ---- 登录 ----
+  if (elBtn && document.getElementById('loginForm')) {
+    document.getElementById('loginForm').addEventListener('submit', function (e) {
+      e.preventDefault();
+
+      var username = (elUser.value || '').trim();
+      var password = elPass.value || '';
+      if (!username || !password) {
+        showLogin('请把账号和密码都填上。');
+        return;
+      }
+
+      elBtn.disabled = true;
+      elBtn.textContent = '登录中…';
+
+      authFetch(apiBase + '/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        // 令牌只走 Authorization 请求头，绝不进 URL：URL 会留在浏览器历史里、
+        // 会被 Referer 带去别的站、还会写进服务器与代理的日志。
+        body: JSON.stringify({ username: username, password: password })
+      })
+        .then(function (r) {
+          return readJson(r).then(function (data) {
+            return { status: r.status, ok: r.ok, data: data };
+          });
+        })
+        .then(function (out) {
+          if (out.ok && out.data && out.data.token) {
+            token = out.data.token;
+            writeSession(TOKEN_KEY, token);
+            writeSession(USER_KEY, JSON.stringify(out.data.user || {}));
+            elPass.value = '';   // 密码不留在表单里
+            showSession(out.data.user || {});
+            return;
+          }
+          showLogin((out.data && out.data.error) || ('登录失败（HTTP ' + out.status + '）'));
+        })
+        .catch(function () {
+          showLogin('连不上这台服务器，先确认上面的「网页地址」能不能打开。');
+        })
+        .then(function () {
+          elBtn.disabled = false;
+          elBtn.textContent = '登录';
+        });
+    });
+  }
+
+  // ---- 退出 ----
+  var elLogout = document.getElementById('logoutBtn');
+  if (elLogout) {
+    elLogout.addEventListener('click', function () {
+      // 后端是签发式令牌，没有「注销」接口；能做的只是把这边的副本丢掉。
+      // 服务端那份还在有效期内（默认 60 分钟），改动密码才会让它立刻作废。
+      token = '';
+      dropSession(TOKEN_KEY);
+      dropSession(USER_KEY);
+      if (elPass) elPass.value = '';
+      showLogin('已退出登录。');
+    });
+  }
+
+  // ---- 刷新后恢复登录态 ----
+  function restore() {
+    if (!token) {
+      showLogin('');
+      return;
+    }
+
+    // 先用缓存把界面摆成「已登录」，再用令牌问一次后端：
+    // 用户信息以服务端为准（角色可能刚被别人改过），
+    // 而这一次请求顺便验证了令牌还有效。
+    var cached = null;
+    try { cached = JSON.parse(readSession(USER_KEY) || 'null'); } catch (e) { cached = null; }
+    if (cached) showSession(cached, '正在确认登录状态…');
+
+    authFetch(apiBase + '/api/auth/profile', {
+      headers: { 'Authorization': 'Bearer ' + token }
+    })
+      .then(function (r) {
+        // 401 已经由 authFetch 里的 expireSession 处理过了。
+        if (r.status === 401) return null;
+        return readJson(r).then(function (data) { return { ok: r.ok, data: data }; });
+      })
+      .then(function (out) {
+        if (!out || !out.ok || !out.data || !out.data.username) return;
+        writeSession(USER_KEY, JSON.stringify(out.data));
+        showSession(out.data);
+      })
+      .catch(function () {
+        // 连不上服务器不等于令牌失效：保留登录态，只说明状态没确认成。
+        if (token) showSession(cached || {}, '暂时无法连接服务器，登录状态未能确认。');
+      });
+  }
+
+  restore();
 })();
 </script>
 </body>

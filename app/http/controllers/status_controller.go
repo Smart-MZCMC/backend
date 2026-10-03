@@ -9,7 +9,7 @@ import (
 type StatusController struct{}
 
 // Version 当前后端版本号。会随发布手动同步，改动见 CHANGELOG。
-const Version = "1.5.6"
+const Version = "1.6.0"
 
 // MinClientVersion 是所有客户端都必须满足的最低适配版本。
 //
@@ -36,8 +36,15 @@ const Version = "1.5.6"
 // 没有一条会让老客户端连上新后端出现功能异常，所以它们看到的应该是琥珀色
 // 「建议更新」，而不是红色「必须更新」。
 //
-// ⚠️ 唯一的行为变化是 ADMIN_MIN_ROLE：默认 logistics，导播账号不再能登录
-// 网页后台。原生导播端走的是 /api/auth/login，完全不受影响。
+// ⚠️ 1.4.2 当时唯一的行为变化是 ADMIN_MIN_ROLE：默认 logistics，导播账号
+// 不再能登录网页后台。原生导播端走的是 /api/auth/login，完全不受影响。
+// 这条描述属于当时的角色等级；等级重排后（后勤降到最低 10、导播升到 30）
+// 默认 logistics 已不再挡住导播，见 config/authz.go 的说明。
+//
+// 1.6.0 同样刻意没有上调。权限模型换成 Casbin 看着动静大，实际是服务端内部
+// 重构：客户端用到的形状——/api/auth/login 的请求与响应、原生界面、WebSocket
+// 消息——一条都没变，策略只落在管理接口上，而客户端从不调那些接口。把老版本
+// 判成「必须更新」会让现场一次性收到一批红色横幅，而它们本来跑得好好的。
 const MinClientVersion = "1.3.0"
 
 func NewStatusController() *StatusController {

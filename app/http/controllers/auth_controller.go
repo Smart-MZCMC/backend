@@ -15,6 +15,7 @@ import (
 
 	"smart-mzcmc/app/audit"
 	"smart-mzcmc/app/models"
+	"smart-mzcmc/app/rbac"
 )
 
 type AuthController struct{}
@@ -54,14 +55,18 @@ func generateToken(user models.User) (string, error) {
 
 // AdminMinRole 返回允许登录管理后台网页的最低角色等级。
 //
-// 配置项写错（比如填了一个不存在的角色名）时退回 logistics 并记日志：
-// 退回 0 会变成「谁都能进后台」，比默认拦掉导播危险得多。
+// 配置项写错（比如填了一个不存在的角色名）时退回 leader 并记日志。
+//
+// 回退值必须与 config/authz.go 的默认值取同一档，否则这条兜底形同虚设：
+// 写错配置时到底落到「只挡导播」还是「谁都能进后台」，全看这个值。
+// 选 leader 是因为它与默认值一致——配置写错时应当退回**正常状态**，而不是
+// 悄悄放宽到全体角色。
 func AdminMinRole() models.Role {
-	raw := strings.TrimSpace(facades.Config().GetString("authz.admin_min_role", "logistics"))
+	raw := strings.TrimSpace(facades.Config().GetString("authz.admin_min_role", "leader"))
 	role := models.Role(raw)
 	if !role.Valid() {
-		log.Printf("[AUTH] authz.admin_min_role=%q 不是合法角色，回退为 %s", raw, models.RoleLogistics)
-		return models.RoleLogistics
+		log.Printf("[AUTH] authz.admin_min_role=%q 不是合法角色，回退为 %s", raw, models.RoleLeader)
+		return models.RoleLeader
 	}
 	return role
 }
@@ -170,8 +175,8 @@ const minPasswordLength = 6
 //
 //  1. 引导模式：用户表为空时，第一个注册的人自动成为超级管理员，且请求里
 //     携带的 role 会被忽略。这是全新部署拿到第一个管理员的唯一途径，
-//  2. 常态：已经有用户之后，注册必须由管理员及以上登录态发起，且只能授予
-//     不高于自己的角色。管理后台的「新建用户」走的也是这个接口。
+//  2. 常态：已经有用户之后，注册必须由持有 user.manage 的账号发起，且只能
+//     授予不高于自己的角色。管理后台的「新建用户」走的也是这个接口。
 //
 // 早期版本既不限制引导条件、也不校验 role，导致任何能访问到端口的人
 // 都能直接开一个 admin 账号并调用全部管理接口。
@@ -208,6 +213,26 @@ func (c *AuthController) Register(ctx http.Context) http.Response {
 			return ctx.Response().Json(aerr.status, map[string]any{"error": aerr.message})
 		}
 		actor = a
+
+		// 必须持有 user.manage 才能建号，与策略表一致。
+		//
+		// 为什么不能只看 guardGrant：那条只管「不能授予高于自己的角色」，
+		// 而发起者**自身**的权限此前没人管。于是一个负责人（等级 40，
+		// user.manage 并不持有、但 user.view 与 project.member 持有）
+		// 可以建出任意一个 ≤ 自己的角色——包括另一个负责人。等于负责人
+		// 绕过了「只有管理员及以上能增删账号」这条矩阵规则。
+		//
+		// 这一段是权限迁移补上的：user.manage 在 policy.csv 里只授予
+		// admin 与 super_admin，但 /api/auth/register 是公开路由、挂不进
+		// RequirePermission（它需要 Jwt() 先把 user_id 写进 ctx，而引导模式
+		// 恰恰没有令牌），所以只能在这里手写一道。
+		if !rbac.Can(models.Role(actor.Role), rbac.PermUserManage) {
+			log.Printf("[AUTH] 拒绝：用户 %s(#%d, %s) 缺少权限 %s，试图创建用户",
+				actor.Username, actor.ID, actor.Role, rbac.PermUserManage)
+			return ctx.Response().Json(403, map[string]any{
+				"error": rbac.DeniedMessage(rbac.PermUserManage, models.Role(actor.Role)),
+			})
+		}
 	}
 
 	if username == "" || password == "" {
@@ -336,6 +361,45 @@ func (c *AuthController) Profile(ctx http.Context) http.Response {
 		return ctx.Response().Json(404, map[string]any{"error": err.Error()})
 	}
 	return ctx.Response().Json(200, userPayload(user))
+}
+
+// Permissions 返回当前登录账号的生效权限清单。
+//
+// 为什么需要它：路由准入已经换成 rbac 的具名权限（见 app/rbac），而管理后台
+// 此前判断「该不该显示这个按钮」靠的是**角色名**——那份逻辑与新的权限名没有任何
+// 映射关系。权限迁移后负责人拿到了 user.view 与 project.member，却仍会因为
+// 角色不是 admin 而看不到入口；反过来他若看到了某个按钮，点了就是 403。
+// 「菜单里没有但地址栏能进」与「菜单里有但点了报错」都是这个不同步造成的。
+//
+// 前端要按权限名渲染，就必须能问后端「我有什么」。这里就是那个问出口。
+//
+// 三个刻意的取舍：
+//   - 只返回**调用者自己**的权限，不返回全量策略矩阵。矩阵是管理界面将来的
+//     数据源，届时单独开一个需要 user.manage 的接口，不该让任何登录用户都能
+//     读到「谁有什么权限」这张表。
+//   - 不返回「某权限受保护」这类保护规则信息。它对渲染按钮没有用处，而把
+//     不变量告诉客户端只会在将来加在线编辑时多一个需要防的点。
+//   - 权限非法时不报 500。selfUser 已经保证了角色合法；万一策略里有脏数据，
+//     少给一个权限名只表现为「按钮少了一个」，比整个页面报错好查。
+func (c *AuthController) Permissions(ctx http.Context) http.Response {
+	user, err := selfUser(ctx)
+	if err != nil {
+		return ctx.Response().Json(404, map[string]any{"error": err.Error()})
+	}
+
+	role := models.Role(user.Role)
+	granted := make([]string, 0, len(rbac.AllPermissions()))
+	for _, perm := range rbac.AllPermissions() {
+		if rbac.Can(role, perm) {
+			granted = append(granted, perm)
+		}
+	}
+
+	return ctx.Response().Json(200, map[string]any{
+		"role":        string(role),
+		"role_label":  role.Label(),
+		"permissions": granted,
+	})
 }
 
 // selfUser 取出当前登录用户。
