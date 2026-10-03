@@ -73,8 +73,7 @@ func TestDeploy_端到端整份换掉站点并清理暂存(t *testing.T) {
 	})
 
 	stagingRoot := filepath.Join(updateDir(filepath.Join(root, "smart-mzcmc")), "stage")
-	want := append([]string{"smart-mzcmc"}, deployTargets...)
-	want = append(want, deployFiles...)
+	want := append([]string{"smart-mzcmc"}, deployDirs...)
 	found, err := extractArchive(archive, stagingRoot, want, nil)
 	if err != nil {
 		t.Fatalf("解包失败: %v", err)
@@ -88,23 +87,18 @@ func TestDeploy_端到端整份换掉站点并清理暂存(t *testing.T) {
 		t.Fatalf("站点校验不该失败: %v", err)
 	}
 
-	// 逐个整份替换
+	// 整份替换：public 与 resources 各作为一个目录
 	dir := updateDir(filepath.Join(root, "smart-mzcmc"))
 	var pending []replaced
-	for _, rel := range deployTargets {
+	for _, rel := range deployDirs {
 		if !found[rel] {
 			continue
 		}
-		if err := replaceDir(root, filepath.Join(stagingRoot, filepath.FromSlash(rel)), rel); err != nil {
+		backup := oldPathFor(root, rel)
+		if err := swapDir(root, filepath.Join(stagingRoot, filepath.FromSlash(rel)), rel, backup); err != nil {
 			t.Fatalf("替换 %s 失败: %v", rel, err)
 		}
-		pending = append(pending, replaced{rel: rel, kind: kindDir, backup: oldPathFor(root, rel)})
-	}
-	for _, rel := range deployFiles {
-		if err := replaceFile(root, filepath.Join(stagingRoot, filepath.FromSlash(rel)), rel); err != nil {
-			t.Fatalf("替换 %s 失败: %v", rel, err)
-		}
-		pending = append(pending, replaced{rel: rel, kind: kindFile, backup: oldPathFor(root, rel)})
+		pending = append(pending, replaced{rel: rel, backup: backup})
 	}
 
 	// 新版本上线

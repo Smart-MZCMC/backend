@@ -57,8 +57,7 @@ func TestExtractArchive_不碰运行期目录(t *testing.T) {
 	})
 
 	root := filepath.Join(t.TempDir(), "stage")
-	want := append([]string{"smart-mzcmc"}, deployTargets...)
-	want = append(want, deployFiles...)
+	want := append([]string{"smart-mzcmc"}, deployDirs...)
 	if _, err := extractArchive(archive, root, want, nil); err != nil {
 		t.Fatalf("应成功，实际 %v", err)
 	}
@@ -81,12 +80,12 @@ func TestVerifyStagedSites_残缺的站点必须拒绝更新(t *testing.T) {
 	})
 
 	root := filepath.Join(t.TempDir(), "stage")
-	found, err := extractArchive(archive, root, []string{"smart-mzcmc", "public/admin"}, nil)
+	found, err := extractArchive(archive, root, []string{"smart-mzcmc", "public"}, nil)
 	if err != nil {
 		t.Fatalf("应成功，实际 %v", err)
 	}
-	if !found["public/admin"] {
-		t.Fatal("包里确实有 public/admin 下的文件，应算认领")
+	if !found["public"] {
+		t.Fatal("包里确实有 public 下的文件，应算认领")
 	}
 	err = verifyStagedSites(root, found)
 	if err == nil {
@@ -103,8 +102,8 @@ func TestVerifyStagedSites_残缺的站点必须拒绝更新(t *testing.T) {
 // 忘了打前端就卡住整个更新。
 func TestVerifyStagedSites_包不带前端时不拦程序更新(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "stage")
-	// found 全 false —— 包里只有可执行文件
-	if err := verifyStagedSites(root, map[string]bool{"public/admin": false}); err != nil {
+	// 包里只有可执行文件，没有 public
+	if err := verifyStagedSites(root, map[string]bool{"smart-mzcmc": true}); err != nil {
 		t.Fatalf("没被认领的站点不该报错，实际 %v", err)
 	}
 }
@@ -114,21 +113,20 @@ func TestVerifyStagedSites_包不带前端时不拦程序更新(t *testing.T) {
 // SvelteKit / Vite 的产物文件名带内容哈希，覆盖式更新只会让旧文件一直留着：
 // 仓库里曾攒到 140 个没有任何入口引用的旧文件，其中一个 public/admin/build/
 // 子目录还被当成第二份后台、以 /admin/build/ 暴露出去。所以替换必须是整份换。
-func TestSwapIn_整份换掉不留残渣(t *testing.T) {
+func TestSwapDir_整份换掉不留残渣(t *testing.T) {
 	root := t.TempDir()
 
 	// 旧站点：带着上一版的哈希产物，还有一个多出来的 build/ 子目录。
-	old := filepath.Join(root, "public", "admin")
-	mustWrite(t, filepath.Join(old, "index.html"), "OLD")
-	mustWrite(t, filepath.Join(old, "_app", "immutable", "old-AAA.js"), "OLDJS")
-	mustWrite(t, filepath.Join(old, "build", "index.html"), "SECOND ADMIN")
+	mustWrite(t, filepath.Join(root, "public", "admin", "index.html"), "OLD")
+	mustWrite(t, filepath.Join(root, "public", "admin", "_app", "immutable", "old-AAA.js"), "OLDJS")
+	mustWrite(t, filepath.Join(root, "public", "admin", "build", "index.html"), "SECOND ADMIN")
 
-	// 新站点
-	staged := filepath.Join(t.TempDir(), "admin")
-	mustWrite(t, filepath.Join(staged, "index.html"), "NEW")
-	mustWrite(t, filepath.Join(staged, "_app", "immutable", "new-BBB.js"), "NEWJS")
+	// 新版本：整个 public 一份
+	staged := filepath.Join(t.TempDir(), "public")
+	mustWrite(t, filepath.Join(staged, "admin", "index.html"), "NEW")
+	mustWrite(t, filepath.Join(staged, "admin", "_app", "immutable", "new-BBB.js"), "NEWJS")
 
-	if err := swapIn(root, staged, "public/admin", oldPathFor(root, "public/admin"), true); err != nil {
+	if err := swapDir(root, staged, "public", oldPathFor(root, "public")); err != nil {
 		t.Fatalf("替换失败: %v", err)
 	}
 
@@ -153,15 +151,12 @@ func TestSwapIn_整份换掉不留残渣(t *testing.T) {
 func TestReplaced_Restore把内容换回去(t *testing.T) {
 	cases := []struct {
 		name    string
-		kind    replaceKind
 		rel     string
 		hadOld  bool
 		oldBody string
 	}{
-		{"目录原先存在", kindDir, "public/admin", true, "OLD"},
-		{"目录原先不存在", kindDir, "public/interviewer", false, ""},
-		{"单文件原先存在", kindFile, "public/index.html", true, "OLDHTML"},
-		{"单文件原先不存在", kindFile, "public/index.html", false, ""},
+		{"目录原先存在", "public", true, "OLD"},
+		{"目录原先不存在", "resources", false, ""},
 	}
 
 	for _, tc := range cases {
@@ -176,7 +171,7 @@ func TestReplaced_Restore把内容换回去(t *testing.T) {
 			}
 			mustWrite(t, target, "NEW") // 换上去的新内容
 
-			if err := (replaced{rel: tc.rel, kind: tc.kind, backup: backup}).restore(root); err != nil {
+			if err := (replaced{rel: tc.rel, backup: backup}).restore(root); err != nil {
 				t.Fatalf("restore 失败: %v", err)
 			}
 
@@ -197,11 +192,12 @@ func TestReplaced_Restore把内容换回去(t *testing.T) {
 // 这条规则防的是「更新垃圾把磁盘吃满」。
 //
 // 每次更新会在 update/ 下落下几十 MB 的发布包、.part、暂存目录，以及换下来的
-// 旧站点。成功之后它们没有任何用途，必须整目录清掉；而失败回滚时又必须留着，
-// 所以清理只能发生在全部步骤成功之后。
-func TestCleanupTarget_更新成功后整个目录都不留(t *testing.T) {
+// 旧站点。进程被杀是常态（systemd 超时、断电、运维直接 kill），那一刻的 update/
+// 就成了孤儿——不会被用到也不会自己消失，下一轮更新又在同一目录上重新铺一遍。
+// 所以清理必须在启动时就做，而不是只在更新成功后做。
+func TestCleanupLeftovers_整个暂存目录不留(t *testing.T) {
 	root := t.TempDir()
-	dir := updateDir(filepath.Join(root, "smart-mzcmc"))
+	dir := updateDir(root)
 
 	for _, p := range []string{
 		"backend-linux-amd64.tar.gz",
@@ -209,23 +205,104 @@ func TestCleanupTarget_更新成功后整个目录都不留(t *testing.T) {
 		"stage/smart-mzcmc",
 		"stage/public/admin/index.html",
 		"old/public/admin/index.html",
+		"old/public/docs/guide/index.html",
 	} {
 		mustWrite(t, filepath.Join(dir, filepath.FromSlash(p)), "x")
 	}
-	if err := os.MkdirAll(filepath.Join(dir, "old", "public", "docs"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	// 部署根里那些真正要留的东西
+	mustWrite(t, filepath.Join(root, "smart-mzcmc"), "BIN")
+	mustWrite(t, filepath.Join(root, "public", "admin", "index.html"), "LIVE")
 
-	if err := os.RemoveAll(dir); err != nil {
+	got, err := CleanupLeftovers(root)
+	if err != nil {
 		t.Fatalf("清理失败: %v", err)
+	}
+	if got != dir {
+		t.Errorf("应报告清掉 %s，实际 %s", dir, got)
 	}
 	if _, err := os.Stat(dir); err == nil {
 		t.Fatal("暂存目录应被整个删掉")
 	}
-	// 备份刻意留在 update/ 之外：它是这一版出问题之后唯一的回退路径。
-	live := filepath.Join(root, "smart-mzcmc")
-	if err := copyFile(live, live+".bak", 0o755); err == nil {
-		t.Fatal("可执行文件不存在时拷贝应当失败，测试前提不成立")
+	if mustRead(t, filepath.Join(root, "public", "admin", "index.html")) != "LIVE" {
+		t.Error("现场那份站点不该被动过")
+	}
+	if mustRead(t, filepath.Join(root, "smart-mzcmc")) != "BIN" {
+		t.Error("可执行文件不该被动过")
+	}
+}
+
+// 没更新过的时候没有 update/ 可清，这必须是正常情况而不是错误——
+// 全新部署的第一次启动就走这条路。
+func TestCleanupLeftovers_没有残留时静默通过(t *testing.T) {
+	root := t.TempDir()
+	dir, err := CleanupLeftovers(root)
+	if err != nil {
+		t.Fatalf("不该报错，实际 %v", err)
+	}
+	if dir != updateDir(root) {
+		t.Errorf("应报告 %s，实际 %s", updateDir(root), dir)
+	}
+}
+
+// 这条规则防的是「传了个空串，清掉的是另一处 update/」。
+//
+// updateDir 对空串会回退到工作目录，于是删的是 <cwd>/update 而不是 <程序目录>/update——
+// 现场那份几十 MB 的残渣永久留着，且全程没有任何报错。宁可不清。
+func TestCleanupLeftovers_拒绝空串(t *testing.T) {
+	for _, root := range []string{"", "   ", "\t\n"} {
+		dir, err := CleanupLeftovers(root)
+		if err == nil {
+			t.Errorf("root=%q 应拒绝清理，实际返回了 %s", root, dir)
+		}
+	}
+}
+
+// 这条规则防的是「守卫哪天被改成删部署根」。
+//
+// RemoveAll 没有第二次机会。无论传进来的是什么目录，都只能删它的 update/ 子目录，
+// 部署根里的二进制、站点、数据库目录一个都不能少。这条用例把「删不掉」写成断言，
+// 而不只是检查函数返回值。
+func TestCleanupLeftovers_传任何目录都只删它的update子目录(t *testing.T) {
+	// 故意混进一层父目录：守卫要是退化成「删传进来的东西」，
+	// 第一个子用例就会把整个 TempDir 连同父目录一起带走。
+	outer := t.TempDir()
+	for _, rel := range []string{"deploy", "deploy2"} {
+		root := filepath.Join(outer, rel)
+		mustWrite(t, filepath.Join(root, "smart-mzcmc"), "BIN")
+		mustWrite(t, filepath.Join(root, "public", "admin", "index.html"), "LIVE")
+		mustWrite(t, filepath.Join(root, "database", "main.db"), "SQLITE")
+		mustWrite(t, filepath.Join(updateDir(root), "old.tar.gz"), "x")
+
+		if _, err := CleanupLeftovers(root); err != nil {
+			t.Fatalf("%s 清理失败: %v", rel, err)
+		}
+
+		for _, keep := range []string{
+			filepath.Join(root, "smart-mzcmc"),
+			filepath.Join(root, "public", "admin", "index.html"),
+			filepath.Join(root, "database", "main.db"),
+		} {
+			if _, err := os.Stat(keep); err != nil {
+				t.Errorf("%s 清理后 %s 消失了", rel, keep)
+			}
+		}
+		if _, err := os.Stat(updateDir(root)); err == nil {
+			t.Errorf("%s 的 update/ 应被删掉", rel)
+		}
+	}
+}
+
+// updateDir 的入参是部署根目录。这个回归用例盯的是「别再把可执行文件名传进来」：
+// 传文件名会拼出工作目录下的 update/，于是下载的发布包与解出来的 stage 全留在那儿，
+// 而启动清理只清程序目录那一份，几十 MB 的残渣永久留下且不报任何错。
+func TestUpdateDir_入参是部署根不是可执行文件名(t *testing.T) {
+	root := t.TempDir()
+	if got, want := updateDir(root), filepath.Join(root, "update"); got != want {
+		t.Errorf("应得到 %s，实际 %s", want, got)
+	}
+	// 与部署根同址：这是启动清理能找到残渣的唯一前提
+	if got := oldPathFor(root, "public"); got != filepath.Join(root, "update", "old", "public") {
+		t.Errorf("备份路径应与暂存目录同在 update/ 下，实际 %s", got)
 	}
 }
 
@@ -246,35 +323,120 @@ func TestStripFirstComponent(t *testing.T) {
 }
 
 // 白名单里不能出现 database / storage / .env 这些运行期数据。
-// 这条用例是给「以后有人往 deployTargets 里加东西」立的规矩。
-func TestDeployTargets_不包含运行期数据(t *testing.T) {
+// 这条用例是给「以后有人往 deployDirs 里加东西」立的规矩。
+func TestDeployDirs_不包含运行期数据(t *testing.T) {
 	banned := []string{"database", "storage", ".env"}
-	all := append(append([]string{}, deployTargets...), deployFiles...)
-	for _, rel := range all {
+	for _, rel := range append(append([]string{}, deployDirs...), deploySentinels...) {
 		for _, bad := range banned {
 			if rel == bad || strings.HasPrefix(rel, bad+"/") {
 				t.Errorf("%s 不该出现在部署白名单里", rel)
 			}
 		}
 	}
-	// 每个站点都要有对应的 index.html 校验，否则残缺的包能覆盖掉能用的后台。
-	// 注意 resources 不在其列：它是 Go 视图模板，本来就没有 index.html。
-	needSentinel := []string{"public/admin", "public/docs", "public/interviewer"}
-	for _, dir := range needSentinel {
-		if !contains(deployTargets, dir) {
-			t.Errorf("%s 必须出现在部署白名单里", dir)
-		}
-		if _, ok := deploySentinels[dir]; !ok {
-			t.Errorf("%s 缺少 index.html 校验规则", dir)
-		}
-	}
-	// 反向：校验规则里不该出现白名单之外的路径，否则等于给一个不会部署的目录
-	// 配了一条永远走不到的检查。
-	for dir := range deploySentinels {
-		if !contains(deployTargets, dir) {
-			t.Errorf("%s 有校验规则但不在部署白名单里", dir)
+	// public 是整份换的，所以包里缺任何一个站点的 index.html 都必须整次更新失败，
+	// 而不是把现存的站点扬掉、换成一份打开就是 404 的后台。
+	//
+	// 注意 resources 不要求有 index.html：它是 Go 视图模板。
+	for _, want := range []string{
+		"public/admin/index.html",
+		"public/docs/index.html",
+		"public/interviewer/index.html",
+	} {
+		if !contains(deploySentinels, want) {
+			t.Errorf("缺少 %s 的校验规则", want)
 		}
 	}
+	// 反向：校验规则里的路径必须真的会被替换，否则等于配了一条永远走不到的检查。
+	for _, s := range deploySentinels {
+		covered := false
+		for _, dir := range deployDirs {
+			if strings.HasPrefix(s, dir+"/") {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			t.Errorf("%s 有校验规则，但不在任何被替换的目录下", s)
+		}
+	}
+}
+
+// 这条规则防的是「白名单里的站点名与仓库里实际的目录对不上」。
+//
+// 上一轮翻车的根因就在这里：更新流程只对着自己造的合成夹具测，夹具里的站点名
+// 是照着白名单写的，于是白名单写错、拼错、漏掉一个站点，测试照样全绿。发布包里
+// 的 public 就是仓库里的 public（tools/package.go 直接把它打进包），所以拿仓库
+// 里的真实文件当基准，才有一条在 CI 里也成立的检查。
+//
+// 顺带挡住另一个方向的错：改了 deployDirs 却忘了加对应的 sentinel 校验规则。
+func TestDeployDirs_与仓库里的真实站点对得上(t *testing.T) {
+	repo := repoRoot(t)
+
+	// 白名单里的每个目录都必须是仓库里真实存在的目录
+	for _, rel := range deployDirs {
+		info, err := os.Stat(filepath.Join(repo, filepath.FromSlash(rel)))
+		if err != nil {
+			t.Errorf("白名单里的 %s 在仓库里不存在: %v", rel, err)
+			continue
+		}
+		if !info.IsDir() {
+			t.Errorf("白名单里的 %s 应该是目录", rel)
+		}
+	}
+
+	// 每个 sentinel 必须是仓库里真实存在的文件，且落在白名单目录下
+	for _, s := range deploySentinels {
+		path := filepath.Join(repo, filepath.FromSlash(s))
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("校验规则要求的 %s 在仓库里不存在: %v", s, err)
+		}
+		inside := false
+		for _, dir := range deployDirs {
+			if strings.HasPrefix(s, dir+"/") {
+				inside = true
+				break
+			}
+		}
+		if !inside {
+			t.Errorf("%s 不在任何会被替换的目录下，校验规则永远走不到", s)
+		}
+	}
+
+	// 反向：仓库里 public 下每一个子目录都要有 sentinel。
+	// 少一个就是那个站点更新完 404，而现象与「更新失败」一模一样。
+	publicDir := filepath.Join(repo, "public")
+	entries, err := os.ReadDir(publicDir)
+	if err != nil {
+		t.Fatalf("读 %s 失败: %v", publicDir, err)
+	}
+	seen := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		seen++
+		want := filepath.ToSlash(filepath.Join("public", e.Name(), "index.html"))
+		if !contains(deploySentinels, want) {
+			t.Errorf("public/%s/ 存在却没有 index.html 校验规则", e.Name())
+		}
+	}
+	if seen == 0 {
+		t.Error("public 下没有任何子目录，测试前提不成立")
+	}
+}
+
+// repoRoot 定位本仓库根目录：从包目录（app/updater）往上两级。
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 测试在包目录下运行；先确认这一点，假定不成立就直接报，不静默找错地方
+	if filepath.Base(wd) != "updater" {
+		t.Fatalf("预期在 app/updater 下运行，实际 %s", wd)
+	}
+	return filepath.Dir(filepath.Dir(wd))
 }
 
 func contains(list []string, want string) bool {

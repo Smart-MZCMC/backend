@@ -10,6 +10,7 @@ import (
 	"smart-mzcmc/app/facades"
 	"smart-mzcmc/app/plugins"
 	"smart-mzcmc/app/setup"
+	"smart-mzcmc/app/updater"
 	"smart-mzcmc/app/ws"
 	"smart-mzcmc/bootstrap"
 )
@@ -25,6 +26,16 @@ func main() {
 	// 全新部署时 database/ 还不存在，SQLite 打不开文件，HasTable 会静默返回
 	// false，迁移就会「全部跳过」而不建任何表，之后服务起来了但表是空的。
 	ensureRuntimeDirs()
+
+	// 清掉上一次更新残留的暂存目录。
+	//
+	// 更新过程中进程被杀（systemd 超时、断电、运维直接 kill）是常态，那一刻的
+	// update/ 就成了孤儿：里面有几十 MB 的压缩包、解出来的旧站点、换下来的上一版。
+	// 它们既不会被用到也不会自己消失，下一轮更新又会在同一个目录上重铺一遍。
+	// 只在更新成功后才清理是不够的——成功路径覆盖不到被打断的那一次。
+	//
+	// 刻意不动 <程序>.bak：它在 update/ 之外，是这一版出问题之后唯一的回退路径。
+	cleanupUpdateLeftovers()
 
 	// 把「跑迁移」这件事注入 setup 包：迁移清单在 bootstrap 里，而
 	// bootstrap → routes → controllers 已经依赖 controllers，controllers
@@ -100,8 +111,27 @@ func runMigrations() error {
 	return nil
 }
 
-// executableDir 返回当前可执行文件所在目录。
-// 解析失败时回退到当前工作目录，让 public/ 至少还有机会被找到。
+// cleanupUpdateLeftovers 清掉 <程序目录>/update。
+//
+// 放在 setup.Prepare 之后、bootstrap.Boot 之前：那时候数据库和目录布局已经就绪，
+// 而任何一次数据库迁移都还没开始。清理失败只告警不中断——它是一次 housekeeping，
+// 不值得因为磁盘满或权限问题让整个服务起不来。
+//
+// 删的目录由 updater.CleanupLeftovers 算，不在这里另拼一份：两处各拼一次迟早
+// 会分叉，而分叉的后果是启动清理只清到自己那一份，另一份几十 MB 的残渣永久留下。
+func cleanupUpdateLeftovers() {
+	dir, err := updater.CleanupLeftovers(executableDir())
+	if err != nil {
+		log.Printf("[Startup] 清理上次更新残留失败: %v（不影响启动，可手工删除 <程序目录>/update）", err)
+		return
+	}
+	// 不存在时 CleanupLeftovers 也返回成功，这时没东西可清，就别报「已清理」。
+	if _, statErr := os.Stat(dir); statErr != nil {
+		return
+	}
+	log.Printf("[Startup] 已清理上次更新残留的 %s", dir)
+}
+
 func executableDir() string {
 	exe, err := os.Executable()
 	if err != nil {

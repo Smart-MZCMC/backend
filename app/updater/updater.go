@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"os"
@@ -401,7 +402,17 @@ func (u *Updater) ApplyWithProgress(current, allowTarget, binaryName string, pro
 	}
 	step("目标版本 %s（%.1f MB）", latest, float64(asset.Size)/(1<<20))
 
-	dir := updateDir(binaryName)
+	// 暂存目录与部署目录同一个锚点，否则启动清理会漏掉一半残渣。
+	//
+	// 这里刻意用 root（可执行文件所在目录）而不是 binaryName：调用方传的是
+	// filepath.Base(exe)，拿它拼路径会落到工作目录下的 update/，于是下载的几十 MB
+	// 发布包和解出来的 stage 全都留在那儿，启动时的 CleanupLeftovers 只清程序目录
+	// 那一份，永远清不掉。
+	root, err := deployRoot()
+	if err != nil {
+		return nil, err
+	}
+	dir := updateDir(root)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -446,14 +457,13 @@ func (u *Updater) ApplyWithProgress(current, allowTarget, binaryName string, pro
 	}
 	step("sha256 校验通过 %s", sum[:16])
 
-	// 3. 解到暂存目录：可执行文件 + 三个静态站点 + 视图模板
+	// 3. 解到暂存目录：可执行文件 + public/ + resources/
 	stage(StageExtracting, "正在解压新版本…")
 	live, err := os.Executable()
 	if err != nil {
 		return nil, err
 	}
 	live, _ = filepath.EvalSymlinks(live)
-	root := filepath.Dir(live)
 
 	// 解压目标统一放在 update/stage 下，与最终部署目录同级——
 	// 跨文件系统 rename 会失败，同盘才保证替换是原子的。
@@ -462,8 +472,7 @@ func (u *Updater) ApplyWithProgress(current, allowTarget, binaryName string, pro
 		return nil, err
 	}
 
-	want := append([]string{binaryName}, deployTargets...)
-	want = append(want, deployFiles...)
+	want := append([]string{binaryName}, deployDirs...)
 	found, err := extractArchive(archivePath, stagingRoot, want, nil)
 	if err != nil {
 		return nil, fmt.Errorf("解压失败: %w", err)
@@ -479,8 +488,8 @@ func (u *Updater) ApplyWithProgress(current, allowTarget, binaryName string, pro
 	}
 	step("已解出 %s（ELF %s）", binaryName, arch)
 
-	// 站点必须完整。包里声称带了某个站点、却没带 index.html，只能说明这个包
-	// 本身是坏的——此时继续下去会把现存的站点整份换掉、后台直接 404。
+	// public 必须完整。包里带着残缺的 public 时若继续下去，会把现存的站点
+	// 整份换掉、后台直接 404——比不更新更糟。
 	if err := verifyStagedSites(stagingRoot, found); err != nil {
 		return nil, err
 	}
@@ -522,25 +531,20 @@ func (u *Updater) ApplyWithProgress(current, allowTarget, binaryName string, pro
 		return reason
 	}
 
-	for _, dir := range deployTargets {
-		if !found[dir] {
+	// 先扬掉再整份拷入。分两步 rename（现有的挪到 update/old，新的挪过来）而不是
+	// 先删后拷：删完再拷的那一瞬目录不存在，而站点正被运行中的服务按请求路径读，
+	// 那一下就是 404。两步之间的窗口只剩一次 rename。
+	for _, rel := range deployDirs {
+		if !found[rel] {
+			step("跳过 %s（发布包里没有）", rel)
 			continue
 		}
-		if err := replaceDir(root, filepath.Join(stagingRoot, dir), dir); err != nil {
+		backup := oldPathFor(root, rel)
+		if err := swapDir(root, filepath.Join(stagingRoot, filepath.FromSlash(rel)), rel, backup); err != nil {
 			return nil, rollback(err)
 		}
-		pending = append(pending, replaced{rel: dir, kind: kindDir, backup: oldPathFor(root, dir)})
-		step("已替换 %s（整份换掉，不留上一版残渣）", dir)
-	}
-	for _, file := range deployFiles {
-		if !found[file] {
-			continue
-		}
-		if err := replaceFile(root, filepath.Join(stagingRoot, file), file); err != nil {
-			return nil, rollback(err)
-		}
-		pending = append(pending, replaced{rel: file, kind: kindFile, backup: oldPathFor(root, file)})
-		step("已替换 %s", file)
+		pending = append(pending, replaced{rel: rel, backup: backup})
+		step("已替换 %s（整份换掉，不留上一版残渣）", rel)
 	}
 
 	// 备份并替换可执行文件
@@ -596,67 +600,50 @@ func (u *Updater) ApplyWithProgress(current, allowTarget, binaryName string, pro
 
 // verifyStagedSites 检查暂存目录里被认领的站点是否完整。
 //
-// 「被认领」指发布包里确实带了该目录（extractArchive 的 found）。包里带了却
-// 缺 index.html 只能说明包本身坏了，此时必须拒绝整次更新：站点是整份换掉的，
-// 带着一份残缺的上去等于把能用的后台换成 404。
+// 「被认领」指发布包里确实带了 public（extractArchive 的 found）。包里带了却
+// 缺任何一个站点的 index.html 只能说明包本身坏了，此时必须拒绝整次更新：
+// public 是整份换掉的，带着一份残缺的上去等于把能用的后台换成 404。
 //
-// 没被认领的站点直接跳过、保留现场那份——发布包不带前端时不该连累程序更新。
+// 没带 public 时直接跳过、保留现场那份——发布包不带前端时不该连累程序更新。
 func verifyStagedSites(stagingRoot string, found map[string]bool) error {
-	for _, rel := range deployTargets {
-		if !found[rel] {
-			continue
-		}
-		sentinel, ok := deploySentinels[rel]
-		if !ok {
-			continue
-		}
-		if _, err := os.Stat(filepath.Join(stagingRoot, filepath.FromSlash(rel), sentinel)); err != nil {
-			return fmt.Errorf("发布包里的 %s 缺少 %s，拒绝用残缺的站点覆盖现有版本", rel, sentinel)
+	if !found["public"] {
+		return nil
+	}
+	for _, sentinel := range deploySentinels {
+		path := filepath.Join(stagingRoot, filepath.FromSlash(sentinel))
+		if _, err := os.Stat(path); err != nil {
+			return fmt.Errorf("发布包里缺少 %s，拒绝用残缺的站点覆盖现有版本", sentinel)
 		}
 	}
 	return nil
 }
 
-// replaced 记录一次已完成的替换，用于迁移失败时回退。
+// replaced 记录一次已完成的目录替换，用于迁移失败时回退。
 type replaced struct {
 	rel    string
-	kind   replaceKind
 	backup string
 }
-type replaceKind int
-
-const (
-	kindDir replaceKind = iota
-	kindFile
-)
 
 // oldPathFor 返回换下来的旧内容在 update/old 下的存放位置。
 func oldPathFor(root, rel string) string {
 	return filepath.Join(updateDir(root), "old", filepath.FromSlash(rel))
 }
 
-// replaceDir 把 staged 整份换到 root/rel：先把现有的挪到 backup，再把新的挪过来。
+// swapDir 把 staged 整份换到 root/rel：先把现有的挪到 backup，再把新的挪过来。
 //
-// 分两步 rename 而不是先删后拷：删完再拷，中间那一瞬目录是不存在的，
-// 而站点是由正在跑的服务按请求路径读的——那一下会 404。
-// 同盘 rename 是原子的，两步之间的窗口只剩一次 rename 的时间。
-func replaceDir(root, staged, rel string) error {
-	return swapIn(root, staged, rel, oldPathFor(root, rel), true)
-}
-
-func replaceFile(root, staged, rel string) error {
-	return swapIn(root, staged, rel, oldPathFor(root, rel), false)
-}
-
-// swapIn 是 replaceDir / replaceFile 的共同实现。
-func swapIn(root, staged, rel, backup string, isDir bool) error {
+// 分两步 rename 而不是先删后拷，正是「先把 public 扬了重新拷入」的意思，
+// 但中间不留空窗：删完再拷的那一瞬目录不存在，而站点正被运行中的服务按请求
+// 路径读，那一下就是 404。同盘 rename 是原子的，两步之间的窗口只剩一次 rename。
+func swapDir(root, staged, rel, backup string) error {
 	target := filepath.Join(root, filepath.FromSlash(rel))
 
 	if err := os.MkdirAll(filepath.Dir(backup), 0o755); err != nil {
 		return err
 	}
 	// 上一次失败可能留下了旧备份，先清掉，否则 rename 到已存在的路径行为不确定。
-	os.RemoveAll(backup)
+	if err := os.RemoveAll(backup); err != nil {
+		return err
+	}
 
 	hadOld := false
 	if _, err := os.Lstat(target); err == nil {
@@ -675,13 +662,7 @@ func swapIn(root, staged, rel, backup string, isDir bool) error {
 		return err
 	}
 
-	var err error
-	if isDir {
-		err = os.Rename(staged, target)
-	} else {
-		err = copyFile(staged, target, 0o644)
-	}
-	if err != nil {
+	if err := os.Rename(staged, target); err != nil {
 		// 换上去失败就把旧的那份挪回来，不能留下一个空目录。
 		if hadOld {
 			os.Rename(backup, target)
@@ -699,10 +680,7 @@ func (r replaced) restore(root string) error {
 		os.RemoveAll(target)
 		return os.Rename(r.backup, target)
 	}
-	if r.kind == kindDir {
-		return os.RemoveAll(target)
-	}
-	return os.Remove(target)
+	return os.RemoveAll(target)
 }
 
 // runMigrate 用新二进制跑一次 migrate。
@@ -883,47 +861,111 @@ func copyFile(src, dst string, mode os.FileMode) error {
 	return os.Rename(tmp, dst)
 }
 
-// deployTargets 是在线更新要替换的**目录**，相对可执行文件所在目录。
+// deployDirs 是在线更新要替换的**目录**，相对部署根目录。
 //
-// 这三个静态站点此前完全不在更新范围内：发布包里带着它们，extractBinary 却只
-// 取可执行文件、其余全丢，于是后端升到新版、管理后台还跑在几个月前的 JS 上
-// （缓存头那侧的问题见 a8eb820，那是另一码事）。
+// 整份换掉而不是覆盖：SvelteKit / Vite 的产物文件名带内容哈希，覆盖只会让上一版的
+// 残渣逐版累积——仓库里曾攒到 140 个没有任何入口引用的旧文件，其中一个
+// public/admin/build/ 子目录还被当成第二份后台、以 /admin/build/ 暴露出去。
 //
-// 站点目录要「先扬掉再整份拷入」而不是覆盖：SvelteKit / Vite 的产物文件名带
-// 内容哈希，覆盖只会让上一版的残渣逐版累积——仓库里曾攒到 140 个没有任何入口
-// 引用的旧文件，其中一个 public/admin/build/ 子目录还被当成第二份后台，
-// 以 /admin/build/ 暴露出去。整份换掉，这一类问题就整个不存在了。
+// 按「整个 public 一份」而不是逐个站点替换，是因为目录枚举一旦漏掉一个站点，
+// 漏掉的那个就会永远停在旧版本，而界面上看不出任何异常。
 //
 // 刻意不含 database/ 与 storage/：包里只有 .keep 占位，而这两个目录里是真实的
 // 数据库与日志。也不含 start.sh / smart-mzcmc.service / .env.example——部署脚手架
 // 由现场维护，自动覆盖可能把改过路径的 systemd unit 冲掉。
-var deployTargets = []string{
-	"public/admin",
-	"public/docs",
-	"public/interviewer",
+var deployDirs = []string{
+	"public",
 	"resources",
 }
 
-// deployFiles 是在线更新要替换的**单文件**，同样相对可执行文件所在目录。
-var deployFiles = []string{
-	"public/index.html",
+// public 必须带的文件。缺了就说明这个包没带前端，此时若继续更新，
+// swapDir 会把现存的站点整个扬掉——后台直接 404。
+//
+// 三个站点都要查而不是只看 admin：docs 与 interviewer 也是后端托管的，
+// 少一个就是那个页面 404，而现象同样是「更新完还是坏的」。
+var deploySentinels = []string{
+	"public/admin/index.html",
+	"public/docs/index.html",
+	"public/interviewer/index.html",
 }
 
-// 站点目录解出后必须存在的文件。缺了就说明这个包没带前端，直接拒绝更新——
-// 总比更新完只剩一个空目录、后台变成 404 强。
-var deploySentinels = map[string]string{
-	"public/admin":       "index.html",
-	"public/docs":        "index.html",
-	"public/interviewer": "index.html",
-}
-
-// updateDir 返回暂存目录：<程序所在目录>/update。
-func updateDir(binaryPath string) string {
-	dir := filepath.Dir(binaryPath)
-	if dir == "" {
-		dir = "."
+// deployRoot 解析部署根目录，也就是 public/ 与 resources/ 的父目录。
+//
+// 按**可执行文件所在目录**解析，与 main.go 里确定发布包根目录的规则一致：
+// 发布包结构是「二进制 + public/ + resources/」，解压即可运行，所以 public 必须
+// 相对可执行文件定位，而不是相对源码路径或工作目录。
+//
+// 此前这里用的是工作目录，而 routes/staticSite.go 里的 /admin、/docs 也是工作目录
+// 相对的，于是「下载→校验→解包→替换程序」全程正常、只有站点纹丝不动——文件确实
+// 换掉了，只是换在了另一套坐标指向的地方。全程没有任何报错，现场只能报一句
+// 「不生效」。
+//
+// 工作目录与程序目录不一致时明确记一笔：这类问题不抛错、不失败，只表现为「没效
+// 果」，不记下来就只能靠猜。
+func deployRoot() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("无法定位当前程序: %w", err)
 	}
-	return filepath.Join(dir, "update")
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+
+	if wd, err := os.Getwd(); err == nil {
+		if wd != filepath.Dir(exe) {
+			log.Printf("[Update] 注意：程序在 %s，工作目录是 %s。前端按程序所在目录部署到 %s",
+				filepath.Dir(exe), wd, filepath.Join(filepath.Dir(exe), "public"))
+		}
+	}
+
+	return filepath.Dir(exe), nil
+}
+
+// CleanupLeftovers 清掉上一次更新残留的暂存目录。
+//
+// 为什么要放在启动时而不是只在更新成功后：更新过程中进程被杀（systemd 超时、
+// 断电、运维直接 kill）是常态，那一刻的 update/ 就成了孤儿——里面有几十 MB 的
+// 压缩包、解出来的旧站点、换下来的上一版。它们既不会被用到，也不会自己消失，
+// 下一轮更新又会在同一个目录上重新铺一遍。
+//
+// 刻意不动 <程序>.bak：它是这一版出问题之后唯一的回退路径，而且放在 update/
+// 之外。也不动 <程序>.incoming：那是同一次更新正在写的临时文件，真被跑到就说明
+// 有两个更新在并发，那属于另一个问题。
+func CleanupLeftovers(root string) (string, error) {
+	// 空串会让 updateDir 回退到工作目录，于是清掉的是另一处 update/——不如不清。
+	// 这条守卫不常有，但 RemoveAll 没有第二次机会。
+	if strings.TrimSpace(root) == "" {
+		return "", errors.New("部署根目录为空，拒绝清理 update 目录")
+	}
+	dir := updateDir(root)
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	// 只删 update 目录本身，不碰它的父目录。updateDir 只会拼出 base 为 update 的
+	// 路径，这里是最后一道闸：万一以后有人改了拼法，宁可不删。
+	if filepath.Base(abs) != "update" {
+		return "", fmt.Errorf("拒绝清理 %s：不是 update 目录", abs)
+	}
+	if _, err := os.Stat(abs); err != nil {
+		if os.IsNotExist(err) {
+			return abs, nil
+		}
+		return abs, err
+	}
+	return abs, os.RemoveAll(abs)
+}
+
+// updateDir 返回暂存目录：<部署根目录>/update。
+//
+// 入参是**部署根目录**（可执行文件所在目录），不是可执行文件路径也不是文件名。
+// 传文件名会拼出工作目录下的 update/，与部署根分属两处——这类不一致不会报错，
+// 只会让启动清理漏掉自己放过的那一半残渣。
+func updateDir(root string) string {
+	if root == "" {
+		root = "."
+	}
+	return filepath.Join(root, "update")
 }
 
 // isNewer 判断 candidate 是否比 current 新。
