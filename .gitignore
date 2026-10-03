@@ -10,3 +10,6 @@ tmp
 server.log
 .mimocode/
 dist/
+# 本地打包输出（MZCMC_DIST_DIR=_dist go run ./tools）。25MB 的发布包不该进版本库，
+# 而它存在时 app/updater 的真实发布包端到端用例会自动启用。
+_dist/
