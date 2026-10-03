@@ -33,5 +33,7 @@ func Migrations() []schema.Migration {
 		&migrations.M20261101000004CreateProjectCamerasTable{},
 		// 敏感操作审计落库，不再只依赖 7 天轮转的 stdout 日志
 		&migrations.M20261101000005CreateAuditLogsTable{},
+		// 权限策略的运行时存储：播种一次之后表即唯一事实来源，policy.csv 退为兜底
+		&migrations.M20261102000001CreateRolePermissionsTable{},
 	}
 }

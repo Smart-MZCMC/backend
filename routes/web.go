@@ -94,41 +94,16 @@ func Web() {
 		// 在策略里只有超管一行，不与任何普通管理权限同级。
 		RegisterSystemRoutes(r)
 
+		// 在线权限编辑。用 system.maintain 当门槛的理由见 RegisterRbacRoutes。
+		RegisterRbacRoutes(r)
+
 		lockController := controllers.NewLockController()
 		RegisterLockRoutes(r, lockController)
 
 		messageController := controllers.NewMessageController()
 		RegisterLogRoutes(r, messageController)
 
-		// 非管理端的项目视图。导播端等项目下拉框靠的是这一条。
-		//
-		// 导播端此前调的是 /api/admin/projects，那挂在 RequireRole(RoleAdmin)
-		// 之后——导播的令牌根本拿不到数据，项目下拉恒定是空的。这一条带成员
-		// 过滤（ProjectController.List 会按 user_projects 收窄），所以它才是
-		// 「我能看到哪些项目」的正确答案；/api/admin/projects 那条不过滤，
-		// 仍然只给管理员。
-		projectController := controllers.NewProjectController()
-		r.Get("/api/projects", projectController.List)
-
-		// 下面这几条都带 projectId，统一挂项目成员校验。
-		// 之前它们从 URL 取 projectId 就直接查库，任何登录用户猜到编号
-		// 就能读任意项目的消息、统计与切台记录。
-		//
-		// 成员校验**不在 app/rbac 里**：它回答的是「能不能看这个项目」，
-		// 与「这个角色能做什么」是正交的两件事。开关
-		// authz.require_project_membership 仍然默认 false（现场要先配齐
-		// 授权再打开），这一点没有因为权限迁移而改变。
-		r.Prefix("/api/messages").Middleware(middleware.RequireProjectMember()).
-			Group(func(mr route.Router) {
-				mr.Get("/:projectId", messageController.ListByProject)
-			})
-
-		r.Prefix("/api/projects").Middleware(middleware.RequireProjectMember()).
-			Group(func(pr route.Router) {
-				pr.Get("/:projectId/cameras", projectController.Cameras)
-				pr.Get("/:projectId/shot-cuts", projectController.ShotCuts)
-				pr.Get("/:projectId/stats", plugins.ProjectStatsHandler)
-			})
+		RegisterProjectRoutes(r, controllers.NewProjectController(), messageController)
 
 		// 插件系统 API
 		r.Get("/api/plugins", plugins.ListPluginsHandler)
@@ -229,6 +204,53 @@ func RegisterAdminRoutes(r route.Router) {
 		})
 }
 
+// RegisterProjectRoutes 挂载 /api/projects 与 /api/messages 下的项目视图接口。
+//
+// **两道守卫的职责严格分开，不要合并**：
+//
+//   - project.view（RequirePermission）回答「这个角色能不能看项目」。
+//   - ProjectMemberMiddleware 回答「这个人能不能看**这一个**项目」。
+//
+// 它们是正交的两件事。合成一件会同时坏掉两侧：只留 project.view 等于让
+// 任何登录用户拉到全部项目（成员过滤形同虚设）；只留成员校验则等于
+// project.view 这项权限没有真正的门——它声明了 8 个角色全持有，却没有任何
+// 路由要求它，于是「某项权限没有任何路由使用」这件事永远不会被发现。
+//
+// 调用方（Web）已经把整组挂在 Jwt() 之后。
+func RegisterProjectRoutes(r route.Router, projectController *controllers.ProjectController, messageController *controllers.MessageController) {
+	// 项目列表（按 user_projects 过滤）。挂 project.view：它过去是条
+	// 「声明了但没有任何路由使用」的死条目——policy.csv 里 8 个角色全持有，
+	// 而后端从没问过它，于是「这项权限可不可以放开」这个问题无处验证。
+	// 现在它是真的门：将来若有人想让某个角色看不到项目列表，改策略即可，
+	// 不必去改路由。
+	r.Middleware(middleware.RequirePermission(rbac.PermProjectView)).
+		Get("/api/projects", projectController.List)
+
+	// 下面这几条都带 projectId，准入**只**由项目成员校验决定，不挂 project.view。
+	// 之前它们从 URL 取 projectId 就直接查库，任何登录用户猜到编号
+	// 就能读任意项目的消息、统计与切台记录。
+	//
+	// 为什么不给它们补 project.view：这几条回答的是「能不能看这个项目」，
+	// 而 project.view 回答「这个角色能不能看项目」。给它们补上等于让角色
+	// 参与项目级授权，是两件事被混在一起——而成员校验才是更严的那一道，
+	// 补 project.view 不会让它更严，只会让「成员校验生效了吗」这个问题
+	// 从路由声明上再也看不出来。
+	//
+	// 开关 authz.require_project_membership 仍然默认 false（现场要先配齐
+	// 授权再打开），这一点没有因为权限迁移而改变。
+	r.Prefix("/api/messages").Middleware(middleware.RequireProjectMember()).
+		Group(func(mr route.Router) {
+			mr.Get("/:projectId", messageController.ListByProject)
+		})
+
+	r.Prefix("/api/projects").Middleware(middleware.RequireProjectMember()).
+		Group(func(pr route.Router) {
+			pr.Get("/:projectId/cameras", projectController.Cameras)
+			pr.Get("/:projectId/shot-cuts", projectController.ShotCuts)
+			pr.Get("/:projectId/stats", plugins.ProjectStatsHandler)
+		})
+}
+
 // RegisterSystemRoutes 挂载 /api/system 下的全部路由。
 //
 // 一组只有一项权限 system.maintain，因为这一组接口的能力太整齐（系统信息、
@@ -246,6 +268,40 @@ func RegisterSystemRoutes(r route.Router) {
 			// 进度查询。更新跑在后台 goroutine 里，这个接口是它唯一的观察窗口。
 			sr.Get("/update/progress", systemController.UpdateProgress)
 			sr.Post("/update/apply", systemController.ApplyUpdate)
+		})
+}
+
+// RegisterRbacRoutes 挂载 /api/rbac 下的在线权限编辑接口。
+//
+// ## 为什么门槛是 system.maintain
+//
+// 它恰好是「不可撤销、只能授予受保护角色」的那一项（app/rbac/protect.go 的
+// protectedPermissions）。用一条受保护权限去守权限编辑入口，本身就构成一个
+// 闭环：将来即使策略被改坏，也不会出现「谁能改权限」这个问题无解——
+// 因为「能改权限的人」那一项永远撤不掉。
+//
+// 它已经是超管独占（policy.csv 里只有一行），所以不需要新增权限项。
+// 换成一项普通权限（比如 user.manage）的话，管理员能给自己开这项权限，
+// 于是「谁能改权限」就成了一个可自举的东西：先给自己授权，再改别人的。
+//
+// ⚠️ 这里的守卫只回答「能不能进这个接口」。改动本身还要过
+// app/rbac.ApplyRolePermissions 里的三条 Validate*（受保护权限不可撤销、
+// 不可授予非受保护角色、受保护角色的任何改动都拒）。中间件与写入校验是
+// 叠加的两层，少掉后者就等于「进得来就改得动」。
+//
+// 调用方（Web）已经把整组挂在 Jwt() 之后。
+func RegisterRbacRoutes(r route.Router) {
+	rbacController := controllers.NewRbacController()
+	r.Prefix("/api/rbac").Middleware(middleware.RequirePermission(rbac.PermSystemMaintain)).
+		Group(func(rr route.Router) {
+			// 读：当前完整矩阵 + 保护状态 + 告警。
+			// 写之前界面必须先拿它，否则无从知道哪些格子是不可点的。
+			rr.Get("/policy", rbacController.ShowPolicy)
+			// 写：把某个角色的权限集合整体改成请求里给的那一组。
+			//
+			// 语义是「替换」而不是「增删」——界面渲染的是一整张勾选表，
+			// 提交的就是全量。用追加语义的话取消勾选永远传不上去。
+			rr.Put("/roles/:role/permissions", rbacController.UpdateRolePermissions)
 		})
 }
 

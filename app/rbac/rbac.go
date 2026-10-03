@@ -13,12 +13,10 @@
 //
 // 三条设计约束。改动这个包之前先读，改动时不要绕过：
 //
-//  1. 策略在 go:embed 的 policy.csv 里，**不进数据库**。现场误配一个勾就把
-//     所有人锁在门外，而数据库策略没法在 code review 里审——它只有一条
-//     UPDATE 记录，看不出「谁因此获得了什么」。策略文件是纯数据、可读、可评审，
-//     而且没有任何数据迁移：policy.csv 本身就是迁移结果。将来真要运行时可编辑，
-//     把下面 load() 里的 stringadapter 换成 gorm 的 fileadapter 即可，
-//     路由声明那一层一行都不用动。
+//  1. 策略存在 role_permissions 表里（在线可编辑），首次启动时用 policy.csv
+//     播种一次。**表一旦有数据，它就是唯一事实来源**；policy.csv 退化为
+//     播种模板与数据库读不出来时的兜底（见 store.go 与 runtime.go）。
+//     策略文件仍然是可读、可评审的纯数据——它只是不再是运行时的权威。
 //
 //  2. 角色 → 权限是显式清单，不走 Casbin 的 g 继承链。g, admin, leader 这种
 //     写法一配错就是越权且无提示，而且它天然表达不了「负责人权限比管理员小」。
@@ -34,6 +32,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 
 	"github.com/casbin/casbin/v2"
 	"github.com/casbin/casbin/v2/model"
@@ -129,12 +128,27 @@ var modelConf string
 //go:embed policy.csv
 var policyCSV string
 
-// defaultEnforcer 是进程内共享的那一个。
+// active 是内存里生效的那一份策略。
 //
-// 加载失败时保持 nil：Can 会因此对所有请求返回 false，也就是**全部拒绝**。
-// 宁可让整套系统当场不可用（一眼能看出是策略坏了），也不能让它在没有策略
-// 的情况下按「无人有权限」以外的任何方式放行。
-var defaultEnforcer *casbin.Enforcer
+// 为什么要一个带锁的容器而不是一个裸 *casbin.Enforcer：在线编辑会**整体替换**
+// 内存里的 Enforcer（Reload），而 Can 在每个受守卫的请求上都会调一次。
+// 裸指针替换 + 并发读是数据竞争，Go 的 race detector 会报，线上则可能是
+// 「一半请求按新策略、一半按旧策略」——权限系统最不能出现的状态。
+//
+// enforcer 为 nil 表示策略没加载起来：Can 因此对所有请求返回 false，也就是
+// **全部拒绝**。宁可让整套系统当场不可用（一眼能看出是策略坏了），也不能让它
+// 在没有策略的情况下按「无人有权限」以外的任何方式放行。
+var active = struct {
+	sync.RWMutex
+	enforcer *casbin.Enforcer
+	source   string
+	warnings []string
+}{source: SourceEmbedded}
+
+// enforcerLocked 取当前生效的 Enforcer。调用方必须已经持有读锁。
+func activeEnforcer() *casbin.Enforcer {
+	return active.enforcer
+}
 
 func init() {
 	e, err := load(modelConf, policyCSV)
@@ -142,7 +156,11 @@ func init() {
 		log.Printf("[RBAC] 策略加载失败，所有具名权限一律拒绝：%v", err)
 		return
 	}
-	defaultEnforcer = e
+	active.Lock()
+	active.enforcer = e
+	active.source = SourceEmbedded
+	active.warnings = embeddedWarnings(e)
+	active.Unlock()
 	auditPolicy(e)
 	auditProtectedRules(e)
 }
@@ -153,7 +171,11 @@ func init() {
 // 跑，而不是靠一个自己实现的判断函数——后者只能证明「那个函数对」，证不了
 // 「策略文件对」。
 //
-// 将来换成数据库策略，改的就是这个函数里 adapter 那一行。
+// 注意策略文本在这里仍然只是一段 CSV：数据库矩阵先被翻译成同样形状的文本
+// （runtime.go 的 matrixToPolicyText），再喂给 Casbin。之所以不接 gorm 的
+// adapter，是因为 Casbin 的 matcher 与行格式都没变，多引一个持久化适配器
+// 只会多一处「adapter 行为与字符串不完全等价」的偏差来源——那正是策略这种
+// 不能出错的东西最不该承担的风险。
 func load(modelText, policyText string) (*casbin.Enforcer, error) {
 	m, err := model.NewModelFromString(modelText)
 	if err != nil {
@@ -161,32 +183,12 @@ func load(modelText, policyText string) (*casbin.Enforcer, error) {
 	}
 	e, err := casbin.NewEnforcer(m, stringadapter.NewAdapter(policyText))
 	if err != nil {
-		return nil, fmt.Errorf("加载 policy.csv: %w", err)
+		return nil, fmt.Errorf("加载策略文本: %w", err)
 	}
 	if err := e.LoadPolicy(); err != nil {
-		return nil, fmt.Errorf("重读 policy.csv: %w", err)
+		return nil, fmt.Errorf("重读策略文本: %w", err)
 	}
 	return e, nil
-}
-
-// Default 返回进程内共享的 Enforcer。
-//
-// 暴露它是为了让测试能用 GetPermissionsForUser 直接读策略内容做自检
-// （「超管是不是真的拿到了全部权限」这类断言必须问策略本身，不能问 Can）。
-// 加载失败时返回 nil，调用方要能处理。
-//
-// ⚠️ **它带着写方法，这是接入在线编辑之前必须堵上的绕过点。**
-//
-// 拿它就能 `rbac.Default().AddPolicy("admin", rbac.PermSystemMaintain)`——
-// protect.go 里的三条 Validate* 一道都不会跑，受保护规则当场失效。
-// 之所以现在还能忍：策略是 go:embed 的只读文件，写入不是业务路径，
-// 而 protect_test.go 会盯住「有人真的这么调了」（下面那条用例）。
-//
-// 接入在线编辑时**第一件事**就是把这个出口收掉：返回一个只读接口，
-// 或者干脆把写方法封进本包，让裸的 AddPolicy/RemovePolicy 从包外不可达。
-// 「Validate 是唯一入口」只有在这个出口消失之后才成立。
-func Default() *casbin.Enforcer {
-	return defaultEnforcer
 }
 
 // Can 报告角色是否持有某项权限。**任何异常都返回 false**。
@@ -200,7 +202,11 @@ func Default() *casbin.Enforcer {
 //   - 权限名未知 → 拒，并打日志。这通常是路由上打错了一个字，权限没有
 //     静悄悄地失效，而是要吵。
 func Can(role models.Role, perm string) bool {
-	if defaultEnforcer == nil {
+	active.RLock()
+	e := activeEnforcer()
+	active.RUnlock()
+
+	if e == nil {
 		log.Printf("[RBAC] 拒绝：Enforcer 未初始化（策略加载失败），角色 %s 请求权限 %s", role, perm)
 		return false
 	}
@@ -214,12 +220,49 @@ func Can(role models.Role, perm string) bool {
 		return false
 	}
 
-	allowed, err := defaultEnforcer.Enforce(string(role), perm)
+	allowed, err := e.Enforce(string(role), perm)
 	if err != nil {
 		log.Printf("[RBAC] 拒绝：Enforce 出错（角色 %s，权限 %s）：%v", role, perm, err)
 		return false
 	}
 	return allowed
+}
+
+// PermissionsOf 返回策略**本身**记给这个角色的权限清单（按声明顺序）。
+//
+// 刻意不走 Can 逐项问一遍：Can 只回答「能不能做」，而这里要回答的是
+// 「策略里到底有没有这一行」。两者不一样——在线编辑界面要展示与提交的是
+// 后者，而超管多出来的那些脏行只能靠它才看得见。
+func PermissionsOf(role models.Role) []string {
+	active.RLock()
+	e := activeEnforcer()
+	active.RUnlock()
+
+	if e == nil || !role.Valid() {
+		return nil
+	}
+	rules, err := e.GetPermissionsForUser(string(role))
+	if err != nil {
+		log.Printf("[RBAC] 读取 %s 的权限失败：%v", role, err)
+		return nil
+	}
+	granted := make(map[string]bool, len(rules))
+	for _, rule := range rules {
+		if len(rule) != 2 {
+			// 字段数不对的行不可能来自本包的写入路径（它们都是拼出来的
+			// `p, role, perm`）。留着不吵只会让界面上多出一格说不清的权限。
+			log.Printf("[RBAC] 策略行字段数不是 2，已忽略：%v", rule)
+			continue
+		}
+		granted[rule[1]] = true
+	}
+	out := make([]string, 0, len(granted))
+	for _, perm := range AllPermissions() {
+		if granted[perm] {
+			out = append(out, perm)
+		}
+	}
+	return out
 }
 
 // Known 报告 perm 是已声明的权限名。

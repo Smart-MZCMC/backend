@@ -194,8 +194,15 @@ func guardLastSuperAdmin(target models.User) *authzError {
 //
 // 转一层是为了让本文件的调用点保持简短：审计的动作名与目标拼装规则
 // 集中在这里，写库细节留给 app/audit。
+//
+// auditSink 是唯一的落地口。抽出来只有一个理由：让「某个端点到底有没有写
+// 审计」这件事可以在不连数据库的情况下被断言——「被拒绝的尝试也要落审计」
+// 是本次权限在线编辑里最该有的一条测试，而 app/audit.Write 真的写表。
+// 测试把 auditSink 换成记到内存的桩（见 rbac_controller_test.go）。
+var auditSink = audit.Write
+
 func recordAudit(ctx http.Context, actor models.User, record audit.Record) {
-	audit.Write(ctx, actor, record)
+	auditSink(ctx, actor, record)
 }
 
 // auditAction 记录一次敏感操作（系统更新、配置变更等）。

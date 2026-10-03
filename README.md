@@ -202,7 +202,7 @@ curl -X POST http://localhost:3000/api/auth/register \
 | `GET` | `/api/messages/:projectId` | 项目消息（最多 200 条） |
 | `GET` | `/api/logs` | 日志查询，支持 `project_id` `type` `sender_id` `from` `to` `limit` `cursor` |
 | `GET` | `/api/plugins` | 已注册插件列表 |
-| `GET` | `/api/projects` | 当前账号有权访问的项目 |
+| `GET` | `/api/projects` | 当前账号有权访问的项目（需 `project.view`，全员持有） |
 | `GET` | `/api/projects/:projectId/cameras` | 机位预设 |
 | `GET` | `/api/projects/:projectId/shot-cuts` | 切台时间线与报表 |
 | `GET` | `/api/projects/:projectId/stats` | 项目统计 |
@@ -325,6 +325,126 @@ curl -X POST http://localhost:3000/api/auth/register \
 掉线扫描用回调注入（`SetPresenceScanner`）而不是让 `plugins` 反向 import
 `app/ws`：`ws` 已经 import 了 `plugins`（要发插件事件），反过来就成环了。
 
+## 权限策略（在线编辑）
+
+准入不再是「等级 ≥ 某个门槛」，而是「角色持有某项**具名权限**」。声明在路由上
+（`middleware.RequirePermission`），内容在 `app/rbac/policy.csv` 与数据库的
+`role_permissions` 表里。等级仍然保留，但它只回答「能不能操作**某个人**」
+（`controllers/authz.go` 的 `decideRoleChange` / `decideDeleteUser`），
+不再管「能不能进某个接口」。
+
+### 策略存在哪
+
+| 阶段 | 事实来源 |
+| :--- | :--- |
+| 首次启动（`role_permissions` 为空） | 用 `app/rbac/policy.csv` **播种一次** |
+| 播种之后 | **数据库表是唯一事实来源** |
+| 数据库读不出来时 | 退回 `policy.csv`，并在日志与 `GET /api/rbac/policy` 的 `warnings` 里说清 |
+
+表里存的是**完整矩阵**（8 角色 × 12 权限 = 96 行，`enabled` 显式落库）而不是差异。
+原因见 `app/models/role_permission.go` 的注释：缺行与「写了但不给」必须能区分开，
+而这两种在出故障时的结论完全相反。
+
+**策略表坏掉不会让服务起不来**，只会退回 `policy.csv`——内嵌的那一份是过 code
+review 的纯数据，它本身就是一份可用策略。直播不该因为一张策略表停摆。
+
+### 接口
+
+两条都挂 `system.maintain`（不是 `user.manage`）：它恰好是「不可撤销、只能授予
+受保护角色」的那一项（`app/rbac/protect.go`），用一条受保护权限去守权限编辑入口
+本身就构成闭环——将来即使策略被改坏，也不会出现「谁能改权限」这个问题无解。
+
+| 方法 | 路径 | 说明 |
+| :--- | :--- | :--- |
+| `GET` | `/api/rbac/policy` | 当前完整矩阵 + 保护状态 + 告警 |
+| `PUT` | `/api/rbac/roles/:role/permissions` | 把该角色的权限集合整体替换 |
+
+`PUT` 的 body 是 `{"permissions":["log.view","project.view"]}`，语义是
+**「改成这样」**：没出现在列表里的权限一律变成不授予（界面渲染的是一整张勾选表，
+提交的就是全量）。
+
+失败时返回 `{"error": "<中文说明>", "code": "<类别>"}`：
+
+| `code` | 状态码 | 含义与处置 |
+| :--- | :--- | :--- |
+| `protected` | 403 | 受保护不可改。**界面应把那一格画成不可点**，不要让用户点 |
+| `unknown_role` | 400 | 角色不存在，刷新 |
+| `unknown_permission` | 400 | 权限不存在，刷新（前端用的还是旧清单） |
+| `policy_conflict` | 409 | 写下去了但重载不通过，**本次已回滚**。提示刷新 |
+| `policy_unavailable` | 503 | 策略表读不出来，稍后重试 |
+
+受保护的那一项（目前只有 `system.maintain`）**不可撤销，且只能授予受保护角色
+（`super_admin`）**；`super_admin` 本身也受保护，任何改动都拒。这些判定在
+`app/rbac` 的 `ValidateGrant` / `ValidateRevoke` / `ValidateRemoveRole` 里，
+写入路径**每一次**都先问它们——`app/rbac` 不导出 `*casbin.Enforcer`，包外拿不到
+任何能 `AddPolicy` 的东西（`app/rbac/bypass_test.go` 钉住了这一点）。
+
+### 权限策略锁死时的离线恢复
+
+守卫的设计前提是「没有 UI 能恢复」，所以这条通道现在就写在这里。
+
+**症状**：超管登录后 `/api/system/*` 与 `/api/rbac/*` 全部 403，或所有角色
+什么都点不了。
+
+**先看日志**：`[RBAC] 拒绝装载：策略违反受保护规则 —— …` 会写清楚是哪一条。
+`GET /api/rbac/policy` 的 `source` 若是 `embedded`，说明服务正在用文件里的策略，
+数据库里那份没生效。
+
+**如果日志指向数据库里的数据**（source 是 `database`），SSH 上直接改。表结构：
+
+```sql
+CREATE TABLE role_permissions (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  role       VARCHAR(20)  NOT NULL DEFAULT '',
+  permission VARCHAR(64)  NOT NULL DEFAULT '',
+  enabled    BOOLEAN      NOT NULL DEFAULT 0,
+  created_at DATETIME,
+  updated_at DATETIME
+);
+```
+
+`(role, permission)` 上有一个**部分唯一索引**
+（`WHERE role != '' AND permission != ''`）。所以「把某个角色的权限改回去」是
+删掉那一角色的全部行、再按需写回，不要试图 UPDATE 单个格子——那样最容易撞唯一
+约束，或者留下 enabled 互相矛盾的两行。
+
+```sh
+sqlite3 database/smart-mzcmc.db
+```
+
+```sql
+-- 1. 先看现状：哪些格子是开的，一眼就能看出被削掉的是谁。
+SELECT role, permission, enabled FROM role_permissions
+WHERE permission = 'system.maintain';
+
+-- 2. 把某个角色的权限集合改回去（这里以「让管理员重新能看用户列表」为例）。
+--    做法是整角色重写：先删该角色全部 12 行，再写回想要的。
+DELETE FROM role_permissions WHERE role = 'admin';
+
+INSERT INTO role_permissions (role, permission, enabled) VALUES
+  ('admin','log.view',1), ('admin','project.view',1), ('admin','user.view',1),
+  ('admin','audit.view',1),    ('admin','log.export',1), ('admin','interview.manage',1),
+  ('admin','project.member',1),('admin','switch.operate',1), ('admin','log.cleanup',1),
+  ('admin','project.manage',1), ('admin','user.manage',1),
+  ('admin','system.maintain',0);
+
+-- 3. 最关键的一步：把系统维护权限交回受保护角色。
+--    它不可撤销，也只能给 super_admin。
+INSERT INTO role_permissions (role, permission, enabled) VALUES
+  ('super_admin','system.maintain',1);
+```
+
+**起不来的那一步**：`sqlite3` 不在手边时，用能执行 SQL 的任何方式都可以（宿主机
+的 sqlite3、DBeaver、Navicat）。没有 GUI 就 `sqlite3 database/smart-mzcmc.db`。
+
+**改完必须重启后端**（或等下一次重载）。内存里的策略与库里的策略可能已经分叉，
+改库不会让运行中的进程立刻换策略——`GET /api/rbac/policy` 的 `source` 是
+`database` 只说明「它读的是库」，不说明「库里这一版就是你刚写的那一版」。
+
+**兜底的兜底**：数据库整个坏了（打不开、表不存在）时，把 `role_permissions`
+表删掉再重启，服务会用 `app/rbac/policy.csv` 重新播种并正常工作——代价是现场
+在线改过的权限全部丢失。那是**已知可用**的状态，不是更坏的状态。
+
 ## 静态站点托管
 
 `routes/staticSite.go` 以全局中间件方式托管两个静态站点：
@@ -361,3 +481,19 @@ curl -X POST http://localhost:3000/api/auth/register \
 工作流里有一道显式校验，拉取失败时会直接提示需要配置这个 secret，而不是只抛一句 404。
 
 如果希望 admin / docs 推送后主动触发后端重建，工作流里已经预留了 `repository_dispatch` 的 `frontend-updated` 事件类型；在 admin / docs 的 workflow 里加一个发事件的步骤即可。
+
+## 数据库迁移
+
+迁移定义在 `database/migrations/`，清单在 `bootstrap/migrations.go`。跑法：
+
+```sh
+./smart-mzcmc migrate          # 只跑迁移，不启动服务
+```
+
+**每一条迁移都必须自己保证幂等**：`runMigrations` 每次启动都遍历全部迁移，
+**不看是否执行过**。所以建表前判 `HasTable`、加列前判 `HasColumn`、建索引前判
+`HasIndex`。
+
+唯一索引要注意 SQLite 的空串：模型里 `Email string`（不是 `*string`）时 GORM
+插入的是 `''` 而不是 NULL，两个空串会被唯一索引判成冲突。所以索引要写成部分
+索引（见 `users_email_unique` 与 `role_permissions_role_permission_unique`）。

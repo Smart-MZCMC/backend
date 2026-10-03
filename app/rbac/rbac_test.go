@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/casbin/casbin/v2"
+
 	"smart-mzcmc/app/models"
 )
 
@@ -143,7 +145,7 @@ func holderSet() map[string]map[models.Role]bool {
 //
 // 96 格全跑的成本是零（策略在内存里），所以没有理由不跑满。
 func TestPolicy_迁移矩阵逐格等于设计意图(t *testing.T) {
-	if Default() == nil {
+	if loadedPolicy() == nil {
 		t.Fatal("策略没加载起来，后续所有断言都没意义")
 	}
 	want := holderSet()
@@ -248,7 +250,7 @@ func TestPolicy_超管拥有全部权限(t *testing.T) {
 // 人关闭（表现为某个按钮点了没反应），而 policy.csv 读起来完全正常。
 // 启动时 auditPolicy 会打日志，测试里则把它变成硬失败。
 func TestPolicy_策略只引用已知角色与已知权限(t *testing.T) {
-	rules, err := Default().GetPolicy()
+	rules, err := loadedPolicy().GetPolicy()
 	if err != nil {
 		t.Fatalf("读策略失败：%v", err)
 	}
@@ -379,9 +381,7 @@ func TestPolicy_给不存在的角色加权限不会放行任何人(t *testing.T
 // 反过来写就是整套系统当场失窃：策略文件写坏了一行，所有接口全开。
 func TestCan_策略没加载起来时一律拒绝(t *testing.T) {
 	silenceLog(t)
-	saved := defaultEnforcer
-	defaultEnforcer = nil
-	t.Cleanup(func() { defaultEnforcer = saved })
+	withPolicy(t, nil)
 
 	for _, role := range models.AllRoles() {
 		for _, perm := range AllPermissions() {
@@ -568,6 +568,22 @@ func TestLabel_每项权限都有中文说明(t *testing.T) {
 	}
 }
 
+// loadedPolicy 取出**当前生效**的那份策略，供用例直接读它的内容。
+//
+// 为什么测试要开这个后门而生产代码不许有：断言必须问策略本身
+// （GetPermissionsForUser：「你给这个角色记了什么」）而不是问 Can
+// （「他能不能做某件事」）——一个不存在的权限和一个存在的权限，Can 都返回
+// false，只有前者能发现策略里的脏行。
+//
+// 它是**包内**测试专用的：放在包外就会又变成一条能 AddPolicy 的旁路，
+// 那正是本次要堵掉的东西。bypass_test.go 断言 rbac 包的导出符号里
+// 没有任何一个提到 casbin —— 那条断言就是这里「只在包内」的理由。
+func loadedPolicy() *casbin.Enforcer {
+	active.RLock()
+	defer active.RUnlock()
+	return activeEnforcer()
+}
+
 // permissionsOf 从**策略本身**读出某角色的权限清单。
 //
 // 刻意不走 Can（逐项问一遍），而是走 GetPermissionsForUser：问策略
@@ -575,7 +591,11 @@ func TestLabel_每项权限都有中文说明(t *testing.T) {
 // 前者才能发现策略里多出来的脏行。
 func permissionsOf(t *testing.T, role models.Role) []string {
 	t.Helper()
-	rules, err := Default().GetPermissionsForUser(string(role))
+	e := loadedPolicy()
+	if e == nil {
+		t.Fatal("策略未加载")
+	}
+	rules, err := e.GetPermissionsForUser(string(role))
 	if err != nil {
 		t.Fatalf("读取 %s 的权限失败：%v", role, err)
 	}
@@ -608,6 +628,23 @@ func roleNames(roles []models.Role) []string {
 		out = append(out, string(r))
 	}
 	return out
+}
+
+// withPolicy 临时替换内存里生效的策略，用例结束后恢复。
+//
+// 存在的原因与 loadedPolicy 一样：包内测试需要能直接摆一份策略进去，
+// 而这条能力**绝不能**出现在包的导出面上（见 bypass_test.go）。
+func withPolicy(t *testing.T, e *casbin.Enforcer) {
+	t.Helper()
+	active.Lock()
+	saved := active.enforcer
+	active.enforcer = e
+	active.Unlock()
+	t.Cleanup(func() {
+		active.Lock()
+		active.enforcer = saved
+		active.Unlock()
+	})
 }
 
 // silenceLog 把标准日志输出丢掉，用例结束后恢复。

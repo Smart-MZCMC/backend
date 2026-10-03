@@ -105,9 +105,9 @@ button { font: inherit; color: inherit; }
 }
 
 /*
- * 隐藏优先于组件样式。页面里有几处用 hidden 属性切登录态与提示条，
- * 而 .account-on / .dl-card 这类选择器的优先级高于浏览器默认的
- * [hidden] { display:none }，不写这条就会「藏不住」。
+ * 隐藏优先于组件样式。页面里有几处用 hidden 属性切提示条的显隐，
+ * 而 .dl-card 这类选择器的优先级高于浏览器默认的 [hidden] { display:none }，
+ * 不写这条就会「藏不住」。
  */
 [hidden] { display: none !important; }
 
@@ -207,57 +207,6 @@ a.chip:hover { border-color: color-mix(in srgb, var(--primary) 45%, var(--border
 .section-title::after { content: ""; flex: 1; height: 1px; background: var(--border); }
 /* 标题下面那句「这一块是干什么的」——现场的人先看这句，再决定要不要读细节 */
 .section-lead { margin: -4px 0 14px; font-size: 13px; line-height: 1.75; color: var(--fg-muted); }
-
-/* ---------- 账号面板 ---------- */
-.account {
-  padding: 18px 20px;
-  margin-bottom: 36px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--bg-surface);
-  box-shadow: var(--shadow-panel);
-}
-.account-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; margin-top: 4px; }
-/* .section-lead 常规是「贴在标题下面的引子」，账号面板里那句是面板的第一句话 */
-.account .section-lead { margin: 0 0 12px; }
-.field { display: flex; flex-direction: column; gap: 5px; flex: 1 1 170px; min-width: 0; }
-.field span { font-size: 12px; color: var(--fg-muted); }
-.field input {
-  min-width: 0;
-  padding: 8px 11px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg-overlay);
-  color: var(--fg);
-  font: inherit;
-  font-size: 13px;
-}
-.field input:focus-visible { border-color: var(--primary); background: var(--bg-surface); }
-.btn {
-  display: inline-flex; align-items: center; justify-content: center;
-  padding: 8px 16px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg-overlay);
-  color: var(--fg);
-  font-size: 13px;
-  cursor: pointer;
-  transition: background-color .15s, color .15s, border-color .15s;
-}
-.btn:hover { background: var(--bg-hover); border-color: var(--border-strong); }
-.btn-primary { background: var(--primary); border-color: var(--primary); color: #fff; }
-.btn-primary:hover { background: var(--primary-ink); border-color: var(--primary-ink); color: #fff; }
-.btn[disabled] { opacity: .6; cursor: default; }
-
-.account-on { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 12px; }
-.who { font-size: 15px; font-weight: 600; }
-.who em { font-style: normal; font-weight: 400; color: var(--fg-muted); margin-left: 8px; font-size: 13.5px; }
-.account-on .btn { margin-left: auto; }
-.account-on .btn + .btn { margin-left: 0; }
-
-.account-msg { margin-top: 10px; font-size: 12.5px; line-height: 1.65; color: var(--fg-muted); }
-.account-msg[data-kind="error"] { color: var(--error-ink); }
-.account-msg[data-kind="warn"] { color: var(--warning-ink); }
 
 /* ---------- 客户端下载 ---------- */
 /* 230px 下限让 4 张卡在 1000px 容器里正好一行，不出现 3+1 的孤儿行 */
@@ -359,7 +308,6 @@ footer .legal a:hover { color: var(--primary-ink); text-decoration: underline; }
      .pill 是 flex:none 且 nowrap，不截的话会把整条顶栏撑破。 */
   .pill { padding: 5px 10px; max-width: 58vw; overflow: hidden; }
   .pill #pillText { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .account-on .btn { margin-left: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -393,43 +341,13 @@ footer .legal a:hover { color: var(--primary-ink); text-decoration: underline; }
     <section class="hero">
       <h1>校园直播导播平台</h1>
       <p>导播、解说、包装、采访四个岗位通过本系统协同工作：导播切换机位，其余各端
-        接收指令并按各自职责呈现。本页面提供三项内容——确认系统运行状态、下载各岗位
-        所需的客户端软件、以及登录管理后台。</p>
+        接收指令并按各自职责呈现。本页面提供两项内容——确认系统运行状态、下载各岗位
+        所需的客户端软件。</p>
       <div class="chips">
-        <a class="chip" href="#account">登录后台</a>
         <a class="chip" href="#downloads">下载软件</a>
         <a class="chip" href="#links">常用入口</a>
       </div>
     </section>
-
-    <h2 class="section-title" id="account">登录后台</h2>
-    <div class="account">
-      <div id="accountAnon">
-        <p class="section-lead">管理后台用于账号与权限管理、项目配置、采访点状态维护及
-          操作日志查询。账号由系统管理员开通；在此登录后可直接进入后台。</p>
-        <form class="account-form" id="loginForm" autocomplete="off" novalidate>
-          <label class="field">
-            <span>账号</span>
-            <input id="loginUser" name="username" type="text" autocomplete="username" spellcheck="false" required>
-          </label>
-          <label class="field">
-            <span>密码</span>
-            <input id="loginPass" name="password" type="password" autocomplete="current-password" required>
-          </label>
-          <button class="btn btn-primary" id="loginBtn" type="submit">登录</button>
-        </form>
-        <p class="account-msg" id="loginMsg" role="status"></p>
-      </div>
-
-      <div id="accountOn" hidden>
-        <div class="account-on">
-          <span class="who"><span id="accountName">—</span><em id="accountRole"></em></span>
-          <a class="btn btn-primary" href="/admin" target="_blank" rel="noopener">进管理后台</a>
-          <button class="btn" id="logoutBtn" type="button">退出</button>
-        </div>
-        <p class="account-msg" id="accountNote" role="status"></p>
-      </div>
-    </div>
 
     <h2 class="section-title" id="downloads">下载软件</h2>
     <p class="section-lead">四个岗位各对应一个客户端，请按本岗位下载。下载地址经由 GitHub
@@ -814,188 +732,6 @@ footer .legal a:hover { color: var(--primary-ink); text-decoration: underline; }
 
   check();
   setInterval(check, 10000);
-
-  // ---- 账号面板 --------------------------------------------------------
-  //
-  // 令牌只放 sessionStorage，不放 localStorage。
-  // 这一页会被转发出去（导播把地址发到工作群里，谁点开都落到「访问这台机器
-  // 的人的浏览器」），localStorage 会把一个能进后台的令牌留在共享电脑的磁盘上，
-  // 下一个用到这台机器的人就是那个人。sessionStorage 关掉标签页即失效，
-  // 刷新还在——现场调试时正好够用，又不留痕。
-  var TOKEN_KEY = 'mzcmc.index.token';
-  var USER_KEY = 'mzcmc.index.user';
-  var token = readSession(TOKEN_KEY);
-
-  // 浏览器禁用存储时（无痕模式、企业策略）读写 sessionStorage 会抛异常，
-  // 不兜住的话整个脚本在第一行就死了，连状态灯都不再刷新。
-  function readSession(key) {
-    try { return sessionStorage.getItem(key) || ''; } catch (e) { return ''; }
-  }
-  function writeSession(key, value) {
-    try { sessionStorage.setItem(key, value); } catch (e) { /* 存不下就退化成「本次有效」 */ }
-  }
-  function dropSession(key) {
-    try { sessionStorage.removeItem(key); } catch (e) { /* 同上 */ }
-  }
-
-  var elAnon = document.getElementById('accountAnon');
-  var elOn = document.getElementById('accountOn');
-  var elMsg = document.getElementById('loginMsg');
-  var elNote = document.getElementById('accountNote');
-  var elUser = document.getElementById('loginUser');
-  var elPass = document.getElementById('loginPass');
-  var elBtn = document.getElementById('loginBtn');
-
-  function showLogin(message) {
-    if (elAnon) elAnon.hidden = false;
-    if (elOn) elOn.hidden = true;
-    if (elMsg) {
-      elMsg.textContent = message || '';
-      elMsg.setAttribute('data-kind', message ? 'error' : 'idle');
-    }
-  }
-
-  function showSession(user, note) {
-    if (elAnon) elAnon.hidden = true;
-    if (elOn) elOn.hidden = false;
-
-    var name = document.getElementById('accountName');
-    var role = document.getElementById('accountRole');
-    // 角色中文名用后端给的 role_label，不在前端自己维护一张角色表——
-    // 加新角色时那种表必然漏改，会把新角色显示成错的。拿不到才退回原始值。
-    var label = (user && user.role_label) || (user && user.role) || '';
-    if (name) name.textContent = (user && user.username) || '已登录';
-    if (role) role.textContent = label;
-
-    if (elNote) {
-      elNote.textContent = note || '本页登录状态仅在当前标签页有效；进入管理后台时需再次验证身份。';
-      elNote.setAttribute('data-kind', note ? 'warn' : 'idle');
-    }
-  }
-
-  // 令牌失效时清干净并明确告诉用户「是过期了」。
-  // 静默退回登录框会让人以为是自己莫名其妙登出了，于是反复输密码。
-  function expireSession() {
-    token = '';
-    dropSession(TOKEN_KEY);
-    dropSession(USER_KEY);
-    showLogin('登录已过期，请重新登录。');
-  }
-
-  // 只在「带着令牌发出的请求」上把 401 当成过期处理。
-  // 登录接口本身也用 401 表示「用户名或密码错误」（见 auth_controller.go），
-  // 那条路径必须把后端的 error 原文显示出来，不能把人踢回登录框。
-  function authFetch(url, options) {
-    if (!token) return fetch(url, options);
-    return fetch(url, options).then(function (r) {
-      if (r.status === 401) expireSession();
-      return r;
-    });
-  }
-
-  // 后端的错误体固定是 {"error": "可读文案"}，但不能假设一定有：
-  // 反代拦截、网关报错时 body 是 HTML 或者是空的。取不到就退回状态码。
-  function readJson(response) {
-    return response.text().then(function (text) {
-      if (!text) return null;
-      try { return JSON.parse(text); } catch (e) { return null; }
-    });
-  }
-
-  // ---- 登录 ----
-  if (elBtn && document.getElementById('loginForm')) {
-    document.getElementById('loginForm').addEventListener('submit', function (e) {
-      e.preventDefault();
-
-      var username = (elUser.value || '').trim();
-      var password = elPass.value || '';
-      if (!username || !password) {
-        showLogin('请把账号和密码都填上。');
-        return;
-      }
-
-      elBtn.disabled = true;
-      elBtn.textContent = '登录中…';
-
-      authFetch(apiBase + '/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        // 令牌只走 Authorization 请求头，绝不进 URL：URL 会留在浏览器历史里、
-        // 会被 Referer 带去别的站、还会写进服务器与代理的日志。
-        body: JSON.stringify({ username: username, password: password })
-      })
-        .then(function (r) {
-          return readJson(r).then(function (data) {
-            return { status: r.status, ok: r.ok, data: data };
-          });
-        })
-        .then(function (out) {
-          if (out.ok && out.data && out.data.token) {
-            token = out.data.token;
-            writeSession(TOKEN_KEY, token);
-            writeSession(USER_KEY, JSON.stringify(out.data.user || {}));
-            elPass.value = '';   // 密码不留在表单里
-            showSession(out.data.user || {});
-            return;
-          }
-          showLogin((out.data && out.data.error) || ('登录失败（HTTP ' + out.status + '）'));
-        })
-        .catch(function () {
-          showLogin('连不上这台服务器，先确认上面的「网页地址」能不能打开。');
-        })
-        .then(function () {
-          elBtn.disabled = false;
-          elBtn.textContent = '登录';
-        });
-    });
-  }
-
-  // ---- 退出 ----
-  var elLogout = document.getElementById('logoutBtn');
-  if (elLogout) {
-    elLogout.addEventListener('click', function () {
-      // 后端是签发式令牌，没有「注销」接口；能做的只是把这边的副本丢掉。
-      // 服务端那份还在有效期内（默认 60 分钟），改动密码才会让它立刻作废。
-      token = '';
-      dropSession(TOKEN_KEY);
-      dropSession(USER_KEY);
-      if (elPass) elPass.value = '';
-      showLogin('已退出登录。');
-    });
-  }
-
-  // ---- 刷新后恢复登录态 ----
-  function restore() {
-    if (!token) {
-      showLogin('');
-      return;
-    }
-
-    // 先用缓存把界面摆成「已登录」，再用令牌问一次后端：
-    // 用户信息以服务端为准（角色可能刚被别人改过），
-    // 而这一次请求顺便验证了令牌还有效。
-    var cached = null;
-    try { cached = JSON.parse(readSession(USER_KEY) || 'null'); } catch (e) { cached = null; }
-    if (cached) showSession(cached, '正在确认登录状态…');
-
-    authFetch(apiBase + '/api/auth/profile', {
-      headers: { 'Authorization': 'Bearer ' + token }
-    })
-      .then(function (r) {
-        // 401 已经由 authFetch 里的 expireSession 处理过了。
-        if (r.status === 401) return null;
-        return readJson(r).then(function (data) { return { ok: r.ok, data: data }; });
-      })
-      .then(function (out) {
-        if (!out || !out.ok || !out.data || !out.data.username) return;
-        writeSession(USER_KEY, JSON.stringify(out.data));
-        showSession(out.data);
-      })
-      .catch(function () {
-        // 连不上服务器不等于令牌失效：保留登录态，只说明状态没确认成。
-        if (token) showSession(cached || {}, '暂时无法连接服务器，登录状态未能确认。');
-      });
-  }
 
   restore();
 })();
