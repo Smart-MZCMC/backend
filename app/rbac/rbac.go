@@ -145,15 +145,130 @@ var active = struct {
 	warnings []string
 }{source: SourceEmbedded}
 
-// enforcerLocked 取当前生效的 Enforcer。调用方必须已经持有读锁。
-func activeEnforcer() *casbin.Enforcer {
+// snapshot 是一次**原子**读出：策略、来源与告警必须来自同一代。
+//
+// 为什么需要它：一次 GET /api/rbac/policy 要读 12 项权限 × 8 个角色 =
+// 96 次 Can，外加 8 次 PermissionsOf、一次 Source、一次 Warnings。如果每一次
+// 各自取一次读锁，那么一次 Reload 落在中间就会拼出一份**半份快照**——
+// source 是旧策略的、holders 是新策略的。
+//
+// 这不是数据竞争，race detector 看不见它，而它的后果恰恰是权限系统最怕的
+// 那种：界面照着这份 JSON 渲染并让管理员据此提交，界面与实际放行从此对不上，
+// 排查方向会被彻底带偏。
+//
+// 一次性取出来之后，Enforcer 本身此后不再被写（Reload 每次都新构造一个），
+// 所以在锁外读它是安全的——这与 Can 拿到指针后放开读锁再 Enforce 是同一条
+// 推理。
+type snapshot struct {
+	enforcer *casbin.Enforcer
+	source   string
+	warnings []string
+}
+
+// take 取一份原子快照。返回的 warnings 是副本，调用方可以随便改。
+//
+// 只给「一次响应要读多个字段」的调用点用（View、DeniedMessage）。单字段的
+// 读走下面的 currentEnforcer：它不复制 warnings 切片，所以在每个受守卫的
+// 请求都调一次的 Can 上不会凭空多出一次分配。
+func take() snapshot {
+	active.RLock()
+	defer active.RUnlock()
+	return snapshot{
+		enforcer: active.enforcer,
+		source:   active.source,
+		warnings: append([]string(nil), active.warnings...),
+	}
+}
+
+// currentEnforcer 取当前生效的 Enforcer 指针。
+//
+// 放开读锁之后再去 Enforce 是安全的：换下来的那个 Enforcer 此后不再被写
+// （Reload 每次都新构造一个再整体换指针）。这条推理是 Can 不必持锁做整个
+// 判定的原因，也是并发读写没有数据竞争的原因。
+func currentEnforcer() *casbin.Enforcer {
+	active.RLock()
+	defer active.RUnlock()
 	return active.enforcer
+}
+
+// currentEnforcerSnapshot 是一条只有 Enforcer 的「快照」。
+//
+// 存在的意义是让 Can / PermissionsOf / Holders 与 View 共用同一份判定逻辑
+// （snapshot.enforce / snapshot.permissionsOf），而不是各写一遍——各写一遍
+// 的话，「快照必须自洽」这个不变量就只在 View 成立，别处会在下一次重构里
+// 悄悄退回逐字段取锁的写法。
+func currentEnforcerSnapshot() snapshot {
+	return snapshot{enforcer: currentEnforcer()}
+}
+
+// enforce 按这份快照回答「能不能做」。与 Can 同一个判定、同一批 fail-closed
+// 规则，但不重新读全局——这是「快照必须自洽」的前提。
+func (s snapshot) enforce(role models.Role, perm string) bool {
+	if s.enforcer == nil {
+		log.Printf("[RBAC] 拒绝：Enforcer 未初始化（策略加载失败），角色 %s 请求权限 %s", role, perm)
+		return false
+	}
+	if !role.Valid() {
+		log.Printf("[RBAC] 拒绝：非法角色 %q 请求权限 %s", role, perm)
+		return false
+	}
+	if !Known(perm) {
+		log.Printf("[RBAC] 拒绝：未知权限名 %q（角色 %s）——"+
+			"路由上打错了权限名，检查 middleware.RequirePermission 的参数", perm, role)
+		return false
+	}
+	allowed, err := s.enforcer.Enforce(string(role), perm)
+	if err != nil {
+		log.Printf("[RBAC] 拒绝：Enforce 出错（角色 %s，权限 %s）：%v", role, perm, err)
+		return false
+	}
+	return allowed
+}
+
+// permissionsOf 按这份快照回答「策略给这个角色记了哪些权限」。与
+// PermissionsOf 同一套语义（包括把脏行吵出来）。
+func (s snapshot) permissionsOf(role models.Role) []string {
+	if s.enforcer == nil || !role.Valid() {
+		return nil
+	}
+	rules, err := s.enforcer.GetPermissionsForUser(string(role))
+	if err != nil {
+		log.Printf("[RBAC] 读取 %s 的权限失败：%v", role, err)
+		return nil
+	}
+	granted := make(map[string]bool, len(rules))
+	for _, rule := range rules {
+		if len(rule) != 2 {
+			// 字段数不对的行不可能来自本包的写入路径（它们都是拼出来的
+			// `p, role, perm`）。留着不吵只会让界面上多出一格说不清的权限。
+			log.Printf("[RBAC] 策略行字段数不是 2，已忽略：%v", rule)
+			continue
+		}
+		granted[rule[1]] = true
+	}
+	out := make([]string, 0, len(granted))
+	for _, perm := range AllPermissions() {
+		if granted[perm] {
+			out = append(out, perm)
+		}
+	}
+	return out
 }
 
 func init() {
 	e, err := load(modelConf, policyCSV)
 	if err != nil {
 		log.Printf("[RBAC] 策略加载失败，所有具名权限一律拒绝：%v", err)
+		// 刻意把这件事也放进 warnings，而不只是打一行日志。Enforcer 为 nil
+		// 时 Can 对一切返回 false，于是整个系统 403——而 GET /api/rbac/policy
+		// 此刻会说「策略来自 embedded」且**一条告警都没有**。管理员看到的是
+		// 一份空矩阵，找不到任何解释，只会去怀疑自己没配好权限。
+		// fail-closed 是对的，但必须让人**看得见**它是 fail-closed。
+		active.Lock()
+		active.warnings = []string{
+			"内嵌策略 policy.csv 加载失败，所有具名权限一律拒绝（fail-closed）：" + err.Error(),
+		}
+		active.Unlock()
 		return
 	}
 	active.Lock()
@@ -202,30 +317,7 @@ func load(modelText, policyText string) (*casbin.Enforcer, error) {
 //   - 权限名未知 → 拒，并打日志。这通常是路由上打错了一个字，权限没有
 //     静悄悄地失效，而是要吵。
 func Can(role models.Role, perm string) bool {
-	active.RLock()
-	e := activeEnforcer()
-	active.RUnlock()
-
-	if e == nil {
-		log.Printf("[RBAC] 拒绝：Enforcer 未初始化（策略加载失败），角色 %s 请求权限 %s", role, perm)
-		return false
-	}
-	if !role.Valid() {
-		log.Printf("[RBAC] 拒绝：非法角色 %q 请求权限 %s", role, perm)
-		return false
-	}
-	if !Known(perm) {
-		log.Printf("[RBAC] 拒绝：未知权限名 %q（角色 %s）——"+
-			"路由上打错了权限名，检查 middleware.RequirePermission 的参数", perm, role)
-		return false
-	}
-
-	allowed, err := e.Enforce(string(role), perm)
-	if err != nil {
-		log.Printf("[RBAC] 拒绝：Enforce 出错（角色 %s，权限 %s）：%v", role, perm, err)
-		return false
-	}
-	return allowed
+	return currentEnforcerSnapshot().enforce(role, perm)
 }
 
 // PermissionsOf 返回策略**本身**记给这个角色的权限清单（按声明顺序）。
@@ -234,35 +326,7 @@ func Can(role models.Role, perm string) bool {
 // 「策略里到底有没有这一行」。两者不一样——在线编辑界面要展示与提交的是
 // 后者，而超管多出来的那些脏行只能靠它才看得见。
 func PermissionsOf(role models.Role) []string {
-	active.RLock()
-	e := activeEnforcer()
-	active.RUnlock()
-
-	if e == nil || !role.Valid() {
-		return nil
-	}
-	rules, err := e.GetPermissionsForUser(string(role))
-	if err != nil {
-		log.Printf("[RBAC] 读取 %s 的权限失败：%v", role, err)
-		return nil
-	}
-	granted := make(map[string]bool, len(rules))
-	for _, rule := range rules {
-		if len(rule) != 2 {
-			// 字段数不对的行不可能来自本包的写入路径（它们都是拼出来的
-			// `p, role, perm`）。留着不吵只会让界面上多出一格说不清的权限。
-			log.Printf("[RBAC] 策略行字段数不是 2，已忽略：%v", rule)
-			continue
-		}
-		granted[rule[1]] = true
-	}
-	out := make([]string, 0, len(granted))
-	for _, perm := range AllPermissions() {
-		if granted[perm] {
-			out = append(out, perm)
-		}
-	}
-	return out
+	return currentEnforcerSnapshot().permissionsOf(role)
 }
 
 // Known 报告 perm 是已声明的权限名。
@@ -291,9 +355,14 @@ func Label(perm string) string {
 // 从**策略本身**读出来，而不是从一张写死的表里抄：这样错误信息里的
 // 「谁能做」不可能与实际放行的集合对不上。
 func Holders(perm string) []models.Role {
+	return currentEnforcerSnapshot().holders(perm)
+}
+
+// holders 是 Holders 的快照版本：同一次回答里的每一项都来自同一代策略。
+func (s snapshot) holders(perm string) []models.Role {
 	var out []models.Role
 	for _, role := range models.AllRoles() {
-		if Can(role, perm) {
+		if s.enforce(role, perm) {
 			out = append(out, role)
 		}
 	}
@@ -311,7 +380,9 @@ func Holders(perm string) []models.Role {
 //	权限不足：缺少权限 project.member（授权/回收项目成员；
 //	仅 负责人、管理员、超级管理员 可执行），当前角色为 导播
 func DeniedMessage(perm string, role models.Role) string {
-	holders := Holders(perm)
+	// 一次性取快照：holders 里的每一项必须来自同一代策略，否则会拼出
+	// 「A 说只有超管能做、B 说超管和负责人都能做」这种自相矛盾的 403 文案。
+	holders := currentEnforcerSnapshot().holders(perm)
 	var who string
 	switch len(holders) {
 	case 0:

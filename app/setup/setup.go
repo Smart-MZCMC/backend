@@ -13,7 +13,6 @@
 package setup
 
 import (
-	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -22,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"testing"
 
 	"smart-mzcmc/app/facades"
 	"smart-mzcmc/app/models"
@@ -96,8 +96,17 @@ func init() {
 }
 
 // inTestBinary 判断当前进程是不是 go test 生成的测试二进制。
+//
+// 必须用 testing.Testing()，不能用 flag.Lookup("test.v") != nil：
+// 测试 flag 是由 testing.Init() 注册的，而 Init() 在包初始化**之后**才被
+// 生成的 main 调用。于是包 init() 里查 flag.CommandLine 时那些 flag 还不存在，
+// 这个判断永远返回 false，`go test` 每跑一次就在当前包目录里写出一个 .env。
+//
+// 那个文件被 .gitignore 挡着、不会误提交，所以它一直只是"污染"而不是"故障"——
+// 也正因为不会误提交，删掉重跑一次就能看见它又出现，排查时很容易归咎于
+// "测试自己写的"而找不到真正的来源。
 func inTestBinary() bool {
-	return flag.Lookup("test.v") != nil
+	return testing.Testing()
 }
 
 // Prepare 在 main 里调用，只负责把「当前处于初始化模式」这件事说出来。

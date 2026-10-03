@@ -1,9 +1,11 @@
 package bootstrap
 
 import (
+	"errors"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	contractsfoundation "github.com/goravel/framework/contracts/foundation"
 	contractsconfiguration "github.com/goravel/framework/contracts/foundation/configuration"
@@ -46,10 +48,14 @@ func Boot() contractsfoundation.Application {
 			//   二、迁移列表是顺序执行的，第 7 条失败时前 6 条已经落库。
 			//      带着这种状态继续服务，报错会出现在毫不相干的地方（某个接口
 			//      突然 500），比「服务没起来、日志里写着哪条迁移失败」难查得多。
+			//
+			// 刻意不加「跳过迁移强行启动」的开关：多一个旋钮就多一种「有人把它关了
+			// 然后忘了」，而这条路径上没有任何安全的降级——schema 与代码对不上之后，
+			// 错误只会出现在毫不相干的接口上。真要绕开，运维有更可控的办法：
+			// 单独跑 migrate 看清原因（见下面提示的第 2 条），或临时把二进制换回
+			// 上一版，那一版的代码本来就匹配旧 schema。
 			if err := RunMigrations(); err != nil {
-				log.Fatalf("[Migrate] 数据库迁移失败，服务拒绝启动: %v。"+
-					"请先修好上面这条迁移（或从数据库备份恢复）再重启。"+
-					"只想确认迁移状态可以执行 `%s migrate`。", err, appName())
+				log.Fatalf("%s", migrationFailureReport(err))
 			}
 
 			// 权限策略的启动装载：策略表为空则用 policy.csv 播种一次，
@@ -82,4 +88,37 @@ func appName() string {
 		return "smart-mzcmc"
 	}
 	return filepath.Base(os.Args[0])
+}
+
+// migrationFailureReport 组织迁移失败时打进日志的那段话。
+//
+// 分行写、每行一件事，是因为读它的人是凌晨被 journalctl 叫起来的运维，而它常常
+// 是 systemd Restart=always 崩溃重启循环里的最后一行。
+//
+// 三条处理建议是按「实际发生频率」排的，不是按「技术相关性」排的。实测下来
+// `table "xxx" already exists` 占绝大多数（另一个实例/另一次 migrate 同时在跑），
+// 所以「先看有没有第二个实例」排在最前面——这一条如果不说，运维看到
+// already exists 的第一反应是「库坏了」，于是去恢复备份，而库根本没坏，
+// 恢复备份反而把现场弄得更乱。
+func migrationFailureReport(err error) string {
+	var b strings.Builder
+	b.WriteString("[Migrate] 数据库迁移失败，服务拒绝启动。\n")
+	b.WriteString("  这不是程序缺陷：迁移是幂等的，反复执行都安全，失败只说明这一次没跑成。\n")
+
+	var me *MigrationError
+	if errors.As(err, &me) {
+		b.WriteString("  失败迁移: " + me.Signature + "\n")
+		b.WriteString("  原始错误: " + me.Err.Error() + "\n")
+	} else {
+		b.WriteString("  原始错误: " + err.Error() + "\n")
+	}
+
+	b.WriteString("  处理办法（按实际发生频率排序）：\n")
+	b.WriteString("   1) 先确认没有第二个实例在同时启动或执行 migrate" +
+		"（systemd 单元配重了、有人在旁边手动起了副本、容器起了两个副本）。" +
+		"报 `already exists` 时九成是这种情况，数据库本身是好的。\n")
+	b.WriteString("   2) 单独确认迁移状态，不启动任何服务：`" + appName() + " migrate`（可反复执行）。\n")
+	b.WriteString("   3) 确认没有并发、单独跑 migrate 仍然失败，才需要人工处理这条迁移：" +
+		"从数据库备份恢复后再启动，或对照 database/migrations/ 手工执行。\n")
+	return b.String()
 }

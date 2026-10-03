@@ -1,7 +1,9 @@
 package controllers
 
 import (
+	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -52,14 +54,51 @@ type fakeAudit struct {
 
 func newFakeStore() *fakeStore { return &fakeStore{} }
 
-// fromEmbedded 按 policy.csv 铺一份完整矩阵。
-func (s *fakeStore) fromEmbedded() error {
-	m, err := rbacEmbeddedMatrix()
-	if err != nil {
-		return err
+// baselineMatrix 是「没被任何用例动过」的权限矩阵，只在第一次用到时取一次。
+//
+// 刻意**快照一次**而不是每次都从 rbac.View() 现取：View() 读的是内存里生效的
+// 那份，而上一条用例的改动会留在那里。于是第二次运行时铺下去的矩阵就带着上一次
+// 的残留——`go test -count=3` 会直接把它暴露成一条「granted 实际为 []」的
+// 莫名其妙失败。用一份固定的基线，每条用例的起点就与执行顺序、与跑了几遍
+// 都无关了。
+var baselineMatrix = sync.OnceValue(func() map[models.Role]map[string]bool {
+	// 走 rbac.View() 而不是直接读 policy.csv：View 是 app/rbac 唯一导出的读出口，
+	// 测试不引入第二条读策略的路——那种「测试自己解析一遍文件」的做法迟早会与
+	// 生产解析分叉，而分叉之后测试还在绿。
+	view := rbac.View()
+	m := map[models.Role]map[string]bool{}
+	for _, role := range models.AllRoles() {
+		cells := map[string]bool{}
+		for _, perm := range rbac.AllPermissions() {
+			cells[perm] = false
+		}
+		m[role] = cells
 	}
-	s.seed(m)
+	for _, r := range view.Roles {
+		for _, perm := range r.Grants {
+			m[models.Role(r.Value)][perm] = true
+		}
+	}
+	return m
+})
+
+// fromEmbedded 按固定基线铺一份完整矩阵。
+func (s *fakeStore) fromEmbedded() error {
+	s.seed(cloneBaseline())
 	return nil
+}
+
+func cloneBaseline() map[models.Role]map[string]bool {
+	src := baselineMatrix()
+	out := map[models.Role]map[string]bool{}
+	for role, cells := range src {
+		copied := map[string]bool{}
+		for perm, enabled := range cells {
+			copied[perm] = enabled
+		}
+		out[role] = copied
+	}
+	return out
 }
 
 func (s *fakeStore) seed(m map[models.Role]map[string]bool) {
@@ -154,6 +193,15 @@ func withPolicyStore(t *testing.T) *fakeStore {
 		t.Fatalf("铺初始矩阵失败：%v", err)
 	}
 	rbac.SetStore(s)
+	// 主动重载一次，把「来源」与「生效中的策略」都定死在这一份基线上。
+	//
+	// 之前这里是靠**泄漏**成立的：cleanup 里 SetStore(nil) 之后调 Reload，
+	// 而没有存储的 Reload 会直接返回错误、**不动内存**，所以上一条用例的
+	// 来源与策略一起留给了下一条。断言 source == database 的用例因此能过，
+	// 但那是靠运气，而 `go test -count=3` 会让运气用完。
+	if err := rbac.Reload(); err != nil {
+		t.Fatalf("从基线装载策略失败：%v", err)
+	}
 
 	savedSink := auditSink
 	auditSink = func(_ contractshttp.Context, _ models.User, record audit.Record) {
@@ -167,34 +215,14 @@ func withPolicyStore(t *testing.T) *fakeStore {
 	}
 	t.Cleanup(func() {
 		auditSink = savedSink
-		// 还原成内嵌策略：app/rbac 包内其他用例断言的是那一份。
+		// 卸掉存储，回到「只有内嵌策略」的状态：app/rbac 包内其他用例断言的
+		// 是那一份。这里**不**指望 SetStore(nil) 之后的 Reload 能还原——
+		// 没有存储的 Reload 会直接返回错误且不动内存（这是它该有的行为），
+		// 所以真正的还原发生在下一条用例的 withPolicyStore 里：它会铺上
+		// 固定基线再主动 Reload 一次。
 		rbac.SetStore(nil)
-		_ = rbac.Reload()
 	})
 	return s
-}
-
-// rbacEmbeddedMatrix 从当前生效的策略反推一份完整矩阵，用来铺初始表。
-//
-// 走 rbac.View() 而不是直接读 policy.csv：View 是 app/rbac 唯一导出的读出口，
-// 测试不引入第二条读策略的路——那种「测试自己解析一遍文件」的做法迟早会与
-// 生产解析分叉，而分叉之后测试还在绿。
-func rbacEmbeddedMatrix() (map[models.Role]map[string]bool, error) {
-	view := rbac.View()
-	m := map[models.Role]map[string]bool{}
-	for _, role := range models.AllRoles() {
-		cells := map[string]bool{}
-		for _, perm := range rbac.AllPermissions() {
-			cells[perm] = false
-		}
-		m[role] = cells
-	}
-	for _, r := range view.Roles {
-		for _, perm := range r.Grants {
-			m[models.Role(r.Value)][perm] = true
-		}
-	}
-	return m, nil
 }
 
 func TestPolicyEndpoint_授予一项权限走完整链路并落审计(t *testing.T) {
@@ -657,6 +685,309 @@ func TestShowPolicy_退回内嵌时source必须说清楚(t *testing.T) {
 	if !rbac.Can(models.RoleSuperAdmin, rbac.PermSystemMaintain) {
 		t.Error("退回内嵌策略后超管应仍持有系统维护权限")
 	}
+}
+
+// TestPolicyEndpoint_没有新增或没有取消时给的是空数组而不是null 防的是前端崩在成功那一瞬。
+//
+// encoding/json 把 Go 的 nil 切片编成 null，而 null 在 JS 里既没有 .length
+// 也没有 .map：前端只要写一句 `res.granted.length` 就会在**保存成功的那一瞬**
+// 抛 TypeError，页面崩掉、还停在编辑态——服务端已经改了，界面说「报错了」。
+// 那种症状会把排查方向彻底带偏（看起来像后端改崩了，其实后端返回的是 200）。
+//
+// 这条用例盯的是**契约本身**：即便调用方忘了归一，JSON 里也必须是 []。
+// 前端那道 toNameList/normaliseRolePermissions 是补丁，防线必须落在这一侧。
+//
+// 两种「空」都要覆盖，因为它们落在不同的分支上：
+//   - 什么都没变：granted 与 revoked 同时为空
+//   - 只新增不取消：revoked 为空而 granted 非空
+func TestPolicyEndpoint_没有新增或没有取消时给的是空数组而不是null(t *testing.T) {
+	cases := []struct {
+		name       string
+		wantGrant  string
+		wantRevoke string
+		build      func(t *testing.T) []string
+	}{
+		{
+			name: "什么都没变（两个都该是空数组）",
+			build: func(t *testing.T) []string {
+				return append([]string(nil), rbac.PermissionsOf(models.RoleDirector)...)
+			},
+		},
+		{
+			name:       "只新增不取消（revoked 该是空数组）",
+			wantGrant:  rbac.PermUserView,
+			wantRevoke: "",
+			build: func(t *testing.T) []string {
+				return append(append([]string(nil), rbac.PermissionsOf(models.RoleDirector)...), rbac.PermUserView)
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := withPolicyStore(t)
+			ctx := newPolicyCtx(t, user(1, models.RoleSuperAdmin),
+				map[string]string{"role": "director"},
+				map[string]any{"permissions": toAny(c.build(t))})
+			resp := replyOf(t, ctx, (NewRbacController()).UpdateRolePermissions(ctx))
+			if resp.status != 200 {
+				t.Fatalf("应返回 200，实际 %d：%v", resp.status, resp.body)
+			}
+
+			// 响应体：字段必须在，且必须是 JSON 数组而不是 null。
+			assertJSONListNotNull(t, "响应体 granted", resp.body, "granted")
+			assertJSONListNotNull(t, "响应体 revoked", resp.body, "revoked")
+			if got := strings.Join(jsonList(resp.body["granted"]), ","); got != c.wantGrant {
+				t.Errorf("granted 应为 %q，实际 %q", c.wantGrant, got)
+			}
+			if got := strings.Join(jsonList(resp.body["revoked"]), ","); got != c.wantRevoke {
+				t.Errorf("revoked 应为 %q，实际 %q", c.wantRevoke, got)
+			}
+
+			// 审计：同一组值进 audit_logs.detail。它是给人复盘用的，
+			// 但同样会被程序读，所以形状必须一样。
+			if len(s.audit) != 1 {
+				t.Fatalf("应落一条审计，实际 %d 条：%v", len(s.audit), s.audit)
+			}
+			for field, want := range map[string]string{
+				"granted": c.wantGrant, "revoked": c.wantRevoke,
+			} {
+				v, present := s.audit[0].detail[field]
+				if !present {
+					t.Errorf("审计 detail 缺少 %q", field)
+					continue
+				}
+				// ⚠️ 不能只判 v == nil：把一个**有类型的** nil 切片装进 any
+				// 之后，接口本身并不等于 nil（它带着 []string 这个类型），
+				// 于���那种写法会安静地放过真正的 bug。真正要问的是
+				// 「序列化之后是不是 null」——那正是 audit.Write 会做的事。
+				assertMarshalsToArrayNotNull(t, "审计 detail 的 "+field, v)
+				list, isList := v.([]string)
+				if !isList {
+					t.Errorf("审计 detail 的 %q 应为 []string，实际 %T", field, v)
+					continue
+				}
+				if got := strings.Join(list, ","); got != want {
+					t.Errorf("审计 detail 的 %q 应为 %q，实际 %q", field, want, got)
+				}
+			}
+		})
+	}
+}
+
+// assertJSONListNotNull 断言 body[field] 是 JSON 数组而不是 null。
+//
+// 走的是 policyResponse.Json 已经做过的那次 marshal/unmarshal，所以看到的就是
+// 前端看到的形状：null 解回 map[string]any 就是 nil，而 [] 解回 []any{}。
+func assertJSONListNotNull(t *testing.T, what string, body map[string]any, field string) {
+	t.Helper()
+	v, present := body[field]
+	if !present {
+		t.Errorf("%s 缺少字段 %q", what, field)
+		return
+	}
+	if v == nil {
+		t.Errorf("%s 的 %q 是 null——前端对它读 .length/.map 会直接抛 TypeError，"+
+			"必须给 [] （空集合是合法状态，不是「没有值」）", what, field)
+		return
+	}
+	if _, isList := v.([]any); !isList {
+		t.Errorf("%s 的 %q 应是 JSON 数组，实际类型 %T", what, field, v)
+	}
+}
+
+// TestPolicyEndpoint_请求体畸形时审计里的requested也是空数组 同一个坑的另一半。
+//
+// 被拒绝的那条审计里有一项 requested，装着「他提交了什么」。而请求体畸形时
+// 它拿不到任何权限——传进来的就是 nil 切片，于是 audit_logs 里同样出现
+// "requested":null。
+//
+// 这里没有改成「省略」：省掉之后，「他提交了空的」与「我们没记下来」在审计里
+// 就再也分不开了，而这两件事要查的地方完全不同。给 [] 才能把两者分开，
+// 也和 granted/revoked 的形状保持一致。
+func TestPolicyEndpoint_请求体畸形时审计里的requested也是空数组(t *testing.T) {
+	s := withPolicyStore(t)
+
+	ctx := newPolicyCtx(t, user(1, models.RoleSuperAdmin),
+		map[string]string{"role": "leader"}, map[string]any{"foo": "bar"})
+	resp := replyOf(t, ctx, (NewRbacController()).UpdateRolePermissions(ctx))
+	if resp.status != 400 {
+		t.Fatalf("畸形请求体应返回 400，实际 %d：%v", resp.status, resp.body)
+	}
+	if len(s.audit) != 1 {
+		t.Fatalf("应落一条审计，实际 %d 条：%v", len(s.audit), s.audit)
+	}
+	v, present := s.audit[0].detail["requested"]
+	if !present {
+		t.Fatal("审计 detail 缺少 requested——答不了「他试图干什么」")
+	}
+	assertMarshalsToArrayNotNull(t, "审计 detail 的 requested", v)
+	if list, isList := v.([]string); !isList || len(list) != 0 {
+		t.Errorf("requested 应为空的 []string，实际 %#v", v)
+	}
+}
+
+// assertMarshalsToArrayNotNull 断言 v 序列化之后是一个 JSON 数组，而不是 null。
+//
+// **必须走序列化**，不能只判 v == nil：一个有类型的 nil 切片（`[]string(nil)`）
+// 装进 any 之后接口并不等于 nil，所以 `v == nil` 会安静地放过真正的 bug。
+// 而 null 正是这次要根除的那个形状——它进到 audit_logs.detail 与 HTTP 响应体里。
+func assertMarshalsToArrayNotNull(t *testing.T, what string, v any) {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("%s 无法序列化：%v", what, err)
+	}
+	if string(raw) == "null" {
+		t.Errorf("%s 序列化后是 null 而不是 []——"+
+			"消费方读它的 .length/.map 会直接抛 TypeError。"+
+			"空集合是合法状态，必须以 [] 出现", what)
+		return
+	}
+	if !strings.HasPrefix(string(raw), "[") {
+		t.Errorf("%s 序列化后不是 JSON 数组：%s", what, raw)
+	}
+}
+
+// TestPolicyEndpoint_审计记的是实际生效的那一组而不是请求里声称的那一组。
+//
+// 这是审计最容易说谎的一处：端点把请求里的 permissions 原样交给
+// rbac.ApplyRolePermissions，而返回的 Change 是「实际生效的增删」。两者在
+// 「部分失败」或「集合里有本来就有的项」时是不同的——
+//
+//	请求声称要把导播的权限改成 {log.view, user.view}，
+//	而导播本来就有 log.view → 真正新增的只有 user.view。
+//
+// 审计必须记后者。记前者的话，「谁多了一项能力」这个问题就答不出来了。
+func TestPolicyEndpoint_审计记的是实际生效的那一组而不是请求里声称的那一组(t *testing.T) {
+	s := withPolicyStore(t)
+
+	before := append([]string(nil), rbac.PermissionsOf(models.RoleDirector)...)
+	if len(before) < 2 {
+		t.Fatalf("前提不成立：导播本该持有多项权限，实际 %v", before)
+	}
+	// 请求里**重复**一遍已经有的项，再加一项它没有的。
+	// 「重复」是为了连「去重之后才算差集」这一点也一起钉住。
+	submitted := append([]string{}, before...)
+	submitted = append(submitted, before...)
+	submitted = append(submitted, rbac.PermUserView)
+
+	ctx := newPolicyCtx(t, user(1, models.RoleSuperAdmin),
+		map[string]string{"role": "director"},
+		map[string]any{"permissions": toAny(submitted)})
+	resp := replyOf(t, ctx, (NewRbacController()).UpdateRolePermissions(ctx))
+	if resp.status != 200 {
+		t.Fatalf("应返回 200，实际 %d：%v", resp.status, resp.body)
+	}
+
+	// 审计里的 granted 必须等于「生效前 → 生效后」的差集，
+	// 而不是请求里多出来的那几项。
+	after := rbac.PermissionsOf(models.RoleDirector)
+	wantGranted, wantRevoked := diffOf(before, after)
+	if len(s.audit) != 1 {
+		t.Fatalf("应落一条审计，实际 %d 条：%v", len(s.audit), s.audit)
+	}
+	gotGranted, _ := s.audit[0].detail["granted"].([]string)
+	gotRevoked, _ := s.audit[0].detail["revoked"].([]string)
+	if strings.Join(sorted(gotGranted), ",") != strings.Join(wantGranted, ",") {
+		t.Errorf("审计的 granted 应是实际新增的 %v（请求里声称的是 %v），实际 %v",
+			wantGranted, submitted, gotGranted)
+	}
+	if strings.Join(sorted(gotRevoked), ",") != strings.Join(wantRevoked, ",") {
+		t.Errorf("审计的 revoked 应是实际取消的 %v，实际 %v", wantRevoked, gotRevoked)
+	}
+	// 响应体与审计必须说的是同一件事，否则前端显示与事后追溯会对不上。
+	respGranted := strings.Join(sorted(jsonList(resp.body["granted"])), ",")
+	if respGranted != strings.Join(wantGranted, ",") {
+		t.Errorf("响应里的 granted 应与实际生效一致：期望 %s，实际 %s",
+			strings.Join(wantGranted, ","), respGranted)
+	}
+}
+
+// TestPolicyEndpoint_审计写不进去也不能让请求失败 防的是「制造审计失败来抹掉痕迹」。
+//
+// 审计是旁路：app/audit.Write 自己吞掉写库错误（只打日志），因为它的判断是
+// 「不能因为它挂了就让正在直播的系统做不了操作」。这条用例把同一件事在端点
+// 这一层钉住——把落地口换成一个什么都不记的实现，响应必须**一字不变**。
+//
+// 反过来若审计失败导致请求 500/503，那它就成了一个攻击面：想让自己的痕迹
+// 消失的人只要先把 audit_logs 弄坏就行。
+func TestPolicyEndpoint_审计写不进去也不能让请求失败(t *testing.T) {
+	s := withPolicyStore(t)
+	// 模拟「审计完全写不进去」：落地口什么都不做，且**不报错**
+	//（auditSink 的签名里根本没有返回值，真实实现只能吞）。
+	saved := auditSink
+	auditSink = func(contractshttp.Context, models.User, audit.Record) {}
+	t.Cleanup(func() { auditSink = saved })
+
+	grant := append(append([]string(nil), rbac.PermissionsOf(models.RoleDirector)...), rbac.PermUserView)
+	ctx := newPolicyCtx(t, user(1, models.RoleSuperAdmin),
+		map[string]string{"role": "director"},
+		map[string]any{"permissions": toAny(grant)})
+	resp := replyOf(t, ctx, (NewRbacController()).UpdateRolePermissions(ctx))
+
+	if resp.status != 200 {
+		t.Fatalf("审计写不进去时请求仍应成功，实际 %d：%v", resp.status, resp.body)
+	}
+	// 而且改动**真的**生效了：审计挂掉不该顺带把权限改动也吞掉。
+	if !rbac.Can(models.RoleDirector, rbac.PermUserView) {
+		t.Error("审计失败不该影响权限改动本身的生效")
+	}
+	if got := s.granted(models.RoleDirector); !strings.Contains(got, rbac.PermUserView) {
+		t.Errorf("审计失败不该让改动没落库，实际 %v", got)
+	}
+}
+
+// TestPolicyEndpoint_被拒绝的尝试不会被审计失败吞成成功。
+//
+// 与上一条是同一个不变量的反面：审计是旁路，不影响响应；但**判定**必须仍然
+// 决定响应。这里断言 403 不会因为审计口安静而变成 200——否则「审计写不进去」
+// 就成了「权限改动被放行」，那比审计丢失严重得多。
+func TestPolicyEndpoint_被拒绝的尝试不会被审计失败吞成成功(t *testing.T) {
+	withPolicyStore(t)
+	saved := auditSink
+	auditSink = func(contractshttp.Context, models.User, audit.Record) {}
+	t.Cleanup(func() { auditSink = saved })
+
+	ctx := newPolicyCtx(t, user(1, models.RoleSuperAdmin),
+		map[string]string{"role": "admin"},
+		map[string]any{"permissions": toAny([]string{rbac.PermSystemMaintain})})
+	resp := replyOf(t, ctx, (NewRbacController()).UpdateRolePermissions(ctx))
+
+	if resp.status != 403 {
+		t.Fatalf("触碰受保护权限仍应返回 403，实际 %d：%v", resp.status, resp.body)
+	}
+	if rbac.Can(models.RoleAdmin, rbac.PermSystemMaintain) {
+		t.Error("管理员拿到了系统维护权限")
+	}
+}
+
+// diffOf 算「从 before 到 after 的差集」，即审计里该记的 granted/revoked。
+func diffOf(before, after []string) (granted, revoked []string) {
+	have := map[string]bool{}
+	for _, p := range before {
+		have[p] = true
+	}
+	want := map[string]bool{}
+	for _, p := range after {
+		want[p] = true
+	}
+	for _, p := range after {
+		if !have[p] {
+			granted = append(granted, p)
+		}
+	}
+	for _, p := range before {
+		if !want[p] {
+			revoked = append(revoked, p)
+		}
+	}
+	return granted, revoked
+}
+
+func sorted(in []string) []string {
+	out := append([]string(nil), in...)
+	sort.Strings(out)
+	return out
 }
 
 func mustReject(t *testing.T, role string, body map[string]any) *policyResponse {

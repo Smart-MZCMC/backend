@@ -209,6 +209,16 @@ func auditPermissionChange(ctx http.Context, actor models.User, change *rbac.Cha
 // 逐条翻 detail 才找得到。
 func auditPermissionDenied(ctx http.Context, actor models.User, role models.Role,
 	requested []string, code rbac.PolicyErrorCode, reason string) {
+	// requested 在「请求体畸形」那条路径上是 nil（压根没解析出权限列表），
+	// 而 nil 切片会被 audit.Write 序列化成 "requested":null。
+	//
+	// 归一成空数组而不是省略这个键：省略之后，「他提交了空的」与「我们没
+	// 记下来」在审计里再也分不开，而这两件事要查的地方完全不同（一次是他
+	// 在试探，一次是审计管线坏了）。给 [] 两者才分得开，形状也才和
+	// granted/revoked 一致——同一个 audit_logs.detail 里不该有两种空值写法。
+	if requested == nil {
+		requested = []string{}
+	}
 	recordAudit(ctx, actor, audit.Record{
 		Action:     "rbac.role_permissions_denied",
 		Summary:    "试图调整 " + role.Label() + " 的权限，被拒绝：" + reason,
@@ -220,7 +230,6 @@ func auditPermissionDenied(ctx http.Context, actor models.User, role models.Role
 			"code":   string(code),
 			// 请求里被提交的那一组也要留着：只知道「他被拒了」不知道
 			// 「他想干什么」，这条审计就答不了「他是不是在反复尝试」。
-			// 非空时才放进去，空数组在审计页上显示成 [] 比省略更难读。
 			"requested": requested,
 		},
 	})

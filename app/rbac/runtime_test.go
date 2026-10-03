@@ -1,6 +1,7 @@
 package rbac
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,6 +38,45 @@ type memStore struct {
 	rows  []row
 	fail  error
 	seeds int
+
+	// loadMutate 在第 n 次 Load（从 1 起）时被调用，用来模拟「这一次读出来
+	// 的是一份违规数据」——现实里就是有人绕过写入路径直接改了表。
+	//
+	// 为什么需要它：写路径是「重载 → 算差集 → 写库 → 重载」，两次重载读的是
+	// 同一张表。只想测第二次重载失败，就必须能按次序决定「哪一次读到坏数据」；
+	// 一个只会一直返回坏数据的 store 会让**第一次**重载就失败，于是根本走不到
+	// 回滚那一步。
+	loadMutate func(call int)
+	loadCalls  int
+
+	// replaceFailFrom 让 ReplaceRole 从第 n 次（从 1 起）起失败，0 表示永不失败。
+	// 分次而不是一刀切，是为了能造出「本次写入成功、回滚写入失败」这个组合。
+	replaceFailFrom int
+	replaceCalls    int
+}
+
+// paintCell 在**锁内**改一格，供 loadMutate 用。
+//
+// 为什么只改一格而不是整表重画：loadMutate 是在 Load 持锁期间被调用的，
+// 既不能调 Load（自死锁），而整表重画会把刚写进去的改动一起抹掉——
+// 而「写进去了、回滚没抹掉」恰恰是那些用例要验证的事实本身。
+func (s *memStore) paintCell(role models.Role, perm string, enabled bool) {
+	for i := range s.rows {
+		if s.rows[i].role == role && s.rows[i].permission == perm {
+			s.rows[i].enabled = enabled
+		}
+	}
+}
+
+// resetLoadCalls 把 Load 计数清零。
+//
+// 给那些「只想让写路径里的第 N 次 Load 读到坏数据」的用例用：绝对计数会
+// 因为前面多跑了一次播种 Reload 而错位，而错位之后用例会因为一个看不懂的
+// 前置条件失败（而不是因为它真正想验证的那件事）红掉。
+func (s *memStore) resetLoadCalls() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.loadCalls = 0
 }
 
 type row struct {
@@ -63,11 +103,25 @@ func (s *memStore) replaceAll(m Matrix) {
 	}
 }
 
+// setAll 是 replaceAll 的加锁版，供**并发**用例使用。
+//
+// 单独一个入口而不是给 replaceAll 加锁：Seed 已经持着锁调 replaceAll，
+// 同一个 Mutex 不可重入，加锁会直接死锁。
+func (s *memStore) setAll(m Matrix) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.replaceAll(m)
+}
+
 func (s *memStore) Load() (Matrix, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fail != nil {
 		return nil, s.fail
+	}
+	s.loadCalls++
+	if s.loadMutate != nil {
+		s.loadMutate(s.loadCalls)
 	}
 	m := Matrix{}
 	for _, r := range s.rows {
@@ -97,6 +151,10 @@ func (s *memStore) ReplaceRole(role models.Role, granted []string) error {
 	defer s.mu.Unlock()
 	if s.fail != nil {
 		return s.fail
+	}
+	s.replaceCalls++
+	if s.replaceFailFrom > 0 && s.replaceCalls >= s.replaceFailFrom {
+		return fmt.Errorf("写入 role_permissions 失败（测试构造，第 %d 次）", s.replaceCalls)
 	}
 	want := make(map[string]bool, len(granted))
 	for _, perm := range granted {
@@ -129,6 +187,22 @@ func (s *memStore) granted(role models.Role) []string {
 	return out
 }
 
+// allRows 把整张表拍平成一个可比较的字符串序列，供「一个字节都不该写」
+// 这类断言使用。
+//
+// 刻意把**不授予**的那些格也拍进去：只看被授予的集合的话，「把 A 换成 B」
+// 这种改动有可能被漏看（两个集合的差集恰好为空是不可能的，但如果断言只比
+// granted，一行的 enabled 从 true 翻成 false 加上另一行翻成 true 就看不出来）。
+func (s *memStore) allRows() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.rows))
+	for _, r := range s.rows {
+		out = append(out, fmt.Sprintf("%s/%s=%v", r.role, r.permission, r.enabled))
+	}
+	return out
+}
+
 var _ Store = (*memStore)(nil)
 
 // useStore 装上测试用的存储，并在用例结束后把内存里的策略与存储一起还原。
@@ -136,6 +210,13 @@ var _ Store = (*memStore)(nil)
 // 还原策略是必须的：这些用例改的是**包级**状态，而同一个包里还有
 // rbac_test.go 那批断言 96 格矩阵的用例。它们靠 init() 装好的 embedded 策略
 // 才有意义，被这里污染的话会红得莫名其妙。
+//
+// ⚠️ 这里**刻意不用 withPolicy** 还原 Enforcer：withPolicy 自己也会注册一个
+// cleanup，把 active.enforcer 还原成**它被调用那一刻**的值——也就是本次用例
+// 刚装上去的那一份。于是「还原」等于什么都没做，每一条用例都会把最后装上的
+// Enforcer 留给后面的用例。绝大多数用例看不出来（它们都从 embedded 播种，
+// 换回去是同一份），一旦有用例刻意装一份**不同**的策略（concurrency_test.go
+// 就在做这件事），后面就会莫名其妙地红。
 func useStore(t *testing.T, s Store) {
 	t.Helper()
 	savedStore := currentStore()
@@ -146,8 +227,8 @@ func useStore(t *testing.T, s Store) {
 	SetStore(s)
 	t.Cleanup(func() {
 		SetStore(savedStore)
-		withPolicy(t, savedEnforcer)
 		active.Lock()
+		active.enforcer = savedEnforcer
 		active.source = savedSource
 		active.warnings = savedWarnings
 		active.Unlock()
@@ -652,31 +733,211 @@ func TestApplyRolePermissions_重载不通过时回滚本次写入(t *testing.T)
 // 磁盘满、数据库被锁、字段约束冲突——写失败时必须原地不动。反过来
 // （先改内存再写库，或者写失败也照样重载）都会让人看到一份
 // 「界面上改了、重启后又变回去」的策略，那是最难解释的一种状态。
+//
+// 分两种失败点各测一次，因为它们落在链路的不同位置：**读表**失败会让写路径
+// 在动任何字节之前就停住（连差集都还没算），**写表**失败则是在算完差集之后。
+// 后者才是「界面上选好了、点保存、库里没进去」那种症状的来源。
 func TestApplyRolePermissions_写库失败时不动生效中的策略(t *testing.T) {
+	cases := []struct {
+		name   string
+		break_ func(*memStore)
+	}{
+		{
+			name:   "写库失败",
+			break_: func(s *memStore) { s.replaceFailFrom = 1 },
+		},
+		{
+			name:   "读库失败",
+			break_: func(s *memStore) { s.fail = fmt.Errorf("磁盘已满（测试构造）") },
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			silenceLog(t)
+			s := newMemStore()
+			useStore(t, s)
+			if err := Reload(); err != nil {
+				t.Fatalf("播种失败：%v", err)
+			}
+			before := PermissionsOf(models.RoleDirector)
+			beforeRows := append([]string(nil), s.granted(models.RoleDirector)...)
+
+			s.mu.Lock()
+			c.break_(s)
+			s.mu.Unlock()
+
+			next := append(append([]string(nil), before...), PermUserView)
+			_, err := ApplyRolePermissions(models.RoleDirector, next)
+			if err == nil {
+				t.Fatal("失败时本次改动应被判为失败")
+			}
+			if got := CodeOf(err); got != ErrCodeUnavailable {
+				t.Errorf("错误类别应为 %q，实际 %q", ErrCodeUnavailable, got)
+			}
+			if Can(models.RoleDirector, PermUserView) {
+				t.Error("失败之后生效策略不该变化")
+			}
+			if got := s.granted(models.RoleDirector); strings.Join(got, ",") != strings.Join(beforeRows, ",") {
+				t.Errorf("失败之后库里不该留下任何改动：\n  之前 %v\n  之后 %v", beforeRows, got)
+			}
+		})
+	}
+}
+
+// TestApplyRolePermissions_库里那份已经违规时一个字节都不写 防的是「顺手带进去」。
+//
+// 场景：有人绕过本项目直接改了表，把 system.maintain 授予了管理员。此时
+// 本项目根本不知道，且改完之后**每一次**重载都会因违反受保护规则而被拒绝。
+//
+// 这时如果有人点一下「保存」：
+//
+//	若写路径不先确认基线可用，它会把本次改动写进库（即便改动本身完全合法），
+//	库里于是多出一份没人审过的改动，而请求返回 409「已回滚」——
+//
+// 回滚能不能成功全看磁盘脸色。
+//
+// 所以期望是：**在动任何字节之前就停住**，库里一个格子都不变。
+func TestApplyRolePermissions_库里那份已经违规时一个字节都不写(t *testing.T) {
 	silenceLog(t)
 	s := newMemStore()
 	useStore(t, s)
 	if err := Reload(); err != nil {
 		t.Fatalf("播种失败：%v", err)
 	}
-	before := PermissionsOf(models.RoleDirector)
 
-	// 让**下一次写入**失败（读取失败会让 Reload 直接报错，那是另一条路径）。
-	s.mu.Lock()
-	s.fail = fmt.Errorf("磁盘已满（测试构造）")
-	s.mu.Unlock()
+	// 绕过写入路径直接改表（现实里就是有人手改了 role_permissions）。
+	// 从此每一次 Load 都读到这一格违规——写路径随后任何一次重载都会失败。
+	s.loadMutate = func(int) { s.paintCell(models.RoleAdmin, PermSystemMaintain, true) }
+	if err := Reload(); err == nil {
+		t.Fatal("前置条件不成立：这份矩阵本该被重载拒绝")
+	}
+	rowsBefore := append([]string(nil), s.allRows()...)
 
-	next := append(append([]string(nil), before...), PermUserView)
+	// 一次完全合法的改动：给导播加一项它可以有的权限。
+	next := append(PermissionsOf(models.RoleDirector), PermUserView)
 	_, err := ApplyRolePermissions(models.RoleDirector, next)
 	if err == nil {
-		t.Fatal("写库失败时本次改动应被判为失败")
+		t.Fatal("库里那份已经违规时不该接受任何改动")
 	}
-	if got := CodeOf(err); got != ErrCodeUnavailable {
-		t.Errorf("错误类别应为 %q，实际 %q", ErrCodeUnavailable, got)
+	if got := CodeOf(err); got != ErrCodeConflict {
+		t.Errorf("错误类别应为 %q，实际 %q", ErrCodeConflict, got)
+	}
+	if got := s.allRows(); strings.Join(got, "|") != strings.Join(rowsBefore, "|") {
+		t.Errorf("一个字节都不该写：\n  之前 %v\n  之后 %v", rowsBefore, got)
 	}
 	if Can(models.RoleDirector, PermUserView) {
-		t.Error("写库失败之后生效策略不该变化")
+		t.Error("被拒绝的改动不该出现在生效策略里")
 	}
+}
+
+// TestApplyRolePermissions_回滚失败后重启不会装上违规策略 是本次最该被钉住的一条。
+//
+// 它回答的是一个具体的、听起来很吓人的猜测：
+//
+//	「写库成功 → 重载失败 → 回滚；回滚本身也失败 →
+//	  库里就留下一份违规策略 → 下次进程重启会把它加载起来吗？」
+//
+// 期望：**不会**。启动路径（Bootstrap → Reload）与运行期路径用的是同一个
+// protectedRuleFindings，违规就是违规，启动时同样拒绝装载，于是退回内嵌
+// policy.csv。内存里那份「上一份可用策略」在启动时本来就是内嵌的，所以重启
+// 之后既不会装上违规策略，也不会让人误以为库里那份生效了。
+//
+// 这条同时钉住了另一个容易被忽略的事实：installEmbedded 必须**真的**把内嵌
+// 策略装进内存。只把 source 标成 embedded 的话，重启后报出来的来源与实际
+// 生效的那份会对不上——管理员会按错误的依据判断「现在到底听谁的」。
+func TestApplyRolePermissions_回滚失败后重启不会装上违规策略(t *testing.T) {
+	silenceLog(t)
+	s := newMemStore()
+	useStore(t, s)
+	if err := Reload(); err != nil {
+		t.Fatalf("播种失败：%v", err)
+	}
+	if !Can(models.RoleSuperAdmin, PermSystemMaintain) {
+		t.Fatal("前置条件不成立：超管本该持有系统维护权限")
+	}
+
+	// 从「这一次 ApplyRolePermissions」开始计数：第 1 次 Load 是写路径自己的
+	// 预重载（必须合法，否则它会在动任何字节之前就停住），第 2 次是写完之后
+	// 的重载 —— 那一次读到违规数据，于是触发回滚。
+	s.loadMutate = func(call int) {
+		if call >= 2 {
+			s.paintCell(models.RoleAdmin, PermSystemMaintain, true)
+		}
+	}
+	s.resetLoadCalls()
+	// 第二次 ReplaceRole 失败 —— 那正是回滚那一次。
+	s.replaceFailFrom = 2
+
+	next := append(PermissionsOf(models.RoleDirector), PermUserView)
+	_, err := ApplyRolePermissions(models.RoleDirector, next)
+	if err == nil {
+		t.Fatal("重载不通过时本次改动应被判为失败")
+	}
+
+	// 此刻库里留下的是「回滚失败」之后的状态：本次改动还在，
+	// 而被污染的违规行也还在。这一刻内存里是安全的（旧策略）。
+	if Can(models.RoleDirector, PermUserView) {
+		t.Error("重载失败之后生效策略不该包含本次改动")
+	}
+	if Can(models.RoleAdmin, PermSystemMaintain) {
+		t.Fatal("前置条件不成立：内存里不该已经装上违规策略")
+	}
+	if !containsString(s.granted(models.RoleDirector), PermUserView) {
+		t.Fatal("前置条件不成立：本构造里的回滚应当失败（库里留着本次改动）")
+	}
+	if !containsString(s.granted(models.RoleAdmin), PermSystemMaintain) {
+		t.Fatal("前置条件不成立：库里应留着那份违规数据")
+	}
+
+	// ── 模拟进程重启 ──────────────────────────────────────────────────
+	// 这里不新起进程：包级状态（store 与内存里的 Enforcer）就是进程状态，
+	// 而「重启」在这套代码里等价于「重新调一次 Bootstrap」。Bootstrap 之所以
+	// 能代表重启，是因为装配点只有它，而它只读 store 与 init 装的那份内嵌策略。
+	Bootstrap()
+
+	if Can(models.RoleAdmin, PermSystemMaintain) {
+		t.Error("❗重启即中招：违规策略在启动时被装载了。" +
+			"启动路径必须与运行期路径一样 fail-closed")
+	}
+	if !Can(models.RoleSuperAdmin, PermSystemMaintain) {
+		t.Error("退回内嵌策略后超管应仍持有系统维护权限——退回不能变成全体失权")
+	}
+	if got := Source(); got != SourceEmbedded {
+		t.Errorf("库里违规时启动应退回内嵌策略，实际来源 %q", got)
+	}
+	// 来源说 embedded，内存里就**必须**真是内嵌那份：库里那份留着本次改动，
+	// 生效的却不能是它。只改 source 不装策略的话，管理员看到的来源与实际
+	// 生效的那份就对不上，而他们正是照着这个来源判断「现在到底听谁的」。
+	if containsString(PermissionsOf(models.RoleDirector), PermUserView) {
+		t.Error("❗声明来自内嵌策略，但生效的却是库里那份——installEmbedded 必须真的装策略，" +
+			"只改 source 等于报了一句谎")
+	}
+	if got, want := strings.Join(PermissionsOf(models.RoleDirector), ","),
+		strings.Join(grantedIn(mustEmbeddedMatrixT(t), models.RoleDirector), ","); got != want {
+		t.Errorf("重启后生效的应是内嵌策略：期望 %v，实际 %v", want, got)
+	}
+	// 而且必须把真正的原因说出来：不是「表坏了」，是「你表里的数据违规」。
+	found := false
+	for _, w := range Warnings() {
+		if strings.Contains(w, "受保护规则") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("退回内嵌策略时必须在告警里说明真正的原因（库里的数据违反受保护规则），"+
+			"否则运维会去查「表为什么读不出来」，而真正的原因是有人手改了数据。实际 %v",
+			Warnings())
+	}
+}
+
+// mustEmbeddedMatrixT 是 embeddedMatrix 的 fatal-on-error 版，给用例用。
+func mustEmbeddedMatrixT(t *testing.T) Matrix {
+	t.Helper()
+	m, err := embeddedMatrix()
+	if err != nil {
+		t.Fatalf("读内嵌策略失败：%v", err)
+	}
+	return m
 }
 
 // TestBootstrap_数据库读不出来时退回内嵌策略并给出告警 钉住「策略表坏掉不停播」。
@@ -750,6 +1011,84 @@ func TestBootstrap_启动时把库里的现场改动带进内存(t *testing.T) {
 	}
 }
 
+// TestApplyRolePermissions_没有变化时也返回非nil切片 防的是 JSON 里出现 null。
+//
+// encoding/json 把 Go 的 nil 切片编成 null。null 在 JS 里既没有 .length 也没有
+// .map，前端一句 `res.granted.length` 就会在**保存成功的那一瞬**抛 TypeError：
+// 页面崩掉、停在编辑态，而后端返回的是 200。现场看起来像「改崩了」，真正
+// 的原因只是「这次没有新增」——排查方向会被彻底带偏。
+//
+// 空集合是**合法且有意义的**状态（这次确实什么都没变），所以它必须以 []
+// 出现，而不是以「没有值」出现。构造点只有 ApplyRolePermissions 一处，
+// 所以这里钉住 `Change` 本身，而不是钉住端点——端点那层另外有两条用例。
+func TestApplyRolePermissions_没有变化时也返回非nil切片(t *testing.T) {
+	silenceLog(t)
+	s := newMemStore()
+	useStore(t, s)
+	if err := Reload(); err != nil {
+		t.Fatalf("播种失败：%v", err)
+	}
+
+	cases := []struct {
+		name       string
+		next       func(current []string) []string
+		wantGrant  []string
+		wantRevoke []string
+	}{
+		{
+			name: "原样提交（什么都没变）",
+			next: func(current []string) []string {
+				return append([]string(nil), current...)
+			},
+		},
+		{
+			name: "只新增不取消",
+			next: func(current []string) []string {
+				return append(append([]string(nil), current...), PermUserView)
+			},
+			wantGrant: []string{PermUserView},
+		},
+		{
+			name: "只取消不新增",
+			next: func(current []string) []string {
+				return removeString(current, PermLogView)
+			},
+			wantRevoke: []string{PermLogView},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			change, err := ApplyRolePermissions(models.RoleDirector, c.next(PermissionsOf(models.RoleDirector)))
+			if err != nil {
+				t.Fatalf("改动应成功，实际 %v", err)
+			}
+			// 逐个判 nil，而不是比长度：长度对而值为 nil 的切片正是那个 bug。
+			if change.Granted == nil {
+				t.Error("Change.Granted 是 nil 切片——JSON 里会是 null 而不是 []")
+			}
+			if change.Revoked == nil {
+				t.Error("Change.Revoked 是 nil 切片——JSON 里会是 null 而不是 []")
+			}
+			if got := strings.Join(change.Granted, ","); got != strings.Join(c.wantGrant, ",") {
+				t.Errorf("Granted 应为 %v，实际 %v", c.wantGrant, change.Granted)
+			}
+			if got := strings.Join(change.Revoked, ","); got != strings.Join(c.wantRevoke, ",") {
+				t.Errorf("Revoked 应为 %v，实际 %v", c.wantRevoke, change.Revoked)
+			}
+			// 再从 JSON 的角度确认一次：这一层就是它真正去的地方。
+			raw, err := json.Marshal(change)
+			if err != nil {
+				t.Fatalf("序列化 Change 失败：%v", err)
+			}
+			for _, field := range []string{`"Granted":null`, `"Revoked":null`} {
+				if strings.Contains(string(raw), field) {
+					t.Errorf("序列化结果里出现 %s：%s", field, raw)
+				}
+			}
+		})
+	}
+}
+
 // TestView_快照与生效策略一致 防的是界面显示与实际放行对不上。
 //
 // 界面渲染的 holders/grants 全靠这份快照。它一旦与 Can 的结果分叉，
@@ -781,6 +1120,25 @@ func TestView_快照与生效策略一致(t *testing.T) {
 	for _, r := range view.Roles {
 		if r.Grants == nil {
 			t.Errorf("角色 %s 的 grants 为 nil", r.Value)
+		}
+	}
+
+	// 快照里**每一个**会被 JSON 序列化的切片字段都必须非 nil。
+	//
+	// 逐个字段点名，而不是只盯 grants/warnings 两个：这份 JSON 是前后端之间
+	// 唯一的契约，少写一个字段名就等于下一次有人加字段时又漏一次——而症状是
+	// 前端在**保存成功的那一瞬**崩掉并停在编辑态，看起来像后端改崩了。
+	// Permissions / Roles 用 nil 判断就够了：make(..., 0, n) 之后它们必然非 nil，
+	// 一旦有人改成 var 声明，这里立刻报。
+	if view.Permissions == nil {
+		t.Error("view.Permissions 为 nil（JSON 里是 null，前端 for...of 直接抛异常）")
+	}
+	if view.Roles == nil {
+		t.Error("view.Roles 为 nil（JSON 里是 null，前端 for...of 直接抛异常）")
+	}
+	for _, p := range view.Permissions {
+		if p.Holders == nil {
+			t.Errorf("权限 %s 的 holders 为 nil（JSON 里是 null，前端读 .length 会抛异常）", p.Name)
 		}
 	}
 

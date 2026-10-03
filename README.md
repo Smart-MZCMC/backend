@@ -42,8 +42,9 @@ go build -o smart-mzcmc .       # 编译
 > 之后用 `curl POST /api/auth/register` 建首个账号（用户表为空时自动成为超级管理员）。
 
 > Goravel 的 `migrate` 原本是 console 命令，但本项目没有接入 console kernel，
-> 所以 `main.go` 里直接遍历 `bootstrap.Migrations()` 调 `Up()`，并且**没有记账表**——
+> 所以迁移由 `bootstrap.RunMigrations()` 执行，并且**没有记账表**——
 > 所有迁移都必须写成幂等的（建表判 `HasTable`、清理用 `DELETE`）。
+> 启动时也会自动跑一遍（见下面「数据库迁移」一节）。
 > 新增迁移后记得在 `docs/development-guide.md` 的迁移表里补一行。
 
 > 注意 `app/setup` 是被 `config` 包**空导入**的，不能删（见 `config/setup.go` 的说明）：
@@ -490,9 +491,25 @@ INSERT INTO role_permissions (role, permission, enabled) VALUES
 ./smart-mzcmc migrate          # 只跑迁移，不启动服务
 ```
 
-**每一条迁移都必须自己保证幂等**：`runMigrations` 每次启动都遍历全部迁移，
+启动时也会自动跑一遍（`bootstrap.Boot()` 的 `WithCallback`，排在 `rbac.Bootstrap()`
+之前）。**迁移失败服务拒绝启动**，日志里写清是哪一条迁移、原始错误、接下来怎么办。
+失败时除了「修好数据库再重启」，还能把二进制换回上一版——那一版的代码本来就匹配
+旧 schema。没有「跳过迁移强行启动」的开关：schema 与代码对不上之后，错误只会出现在
+毫不相干的接口上，那种状态下「服务能起来」比「服务起不来」更难查。
+
+**每一条迁移都必须自己保证幂等**：`RunMigrations` 每次启动都遍历全部迁移，
 **不看是否执行过**。所以建表前判 `HasTable`、加列前判 `HasColumn`、建索引前判
-`HasIndex`。
+`HasIndex`。在线更新会跑一次迁移、退出进程、systemd 拉起新二进制再跑一次，
+同一次更新里这批迁移因此被执行两遍——幂等就是这里的前提条件。
+
+整批迁移外面套了一把跨进程互斥锁（`<数据库文件>.migrate.lock`，见
+`bootstrap/lock.go`）。每条迁移的「判存在性」与「建出来」不是原子的，两个实例同时
+启动会同时看到「表不存在」，后到的那个拿到 `table "xxx" already exists` 并拒绝启动
+——也就是一个误启动的副本会把正常服务顶掉。光让 DDL 认下这个错还不够：
+`20261101000004_create_project_cameras_table` 那种「查了没有就灌数据」的迁移在并发下
+会灌出双份（实测一个项目 20 个机位、两边退出码都是 0、日志里一句异常都没有）。
+所以是互斥，不是容错。拿不到锁时先接管残留锁、再不行就吵醒照常跑——迁移幂等，
+等锁只是为了不撞车，不是正确性的前提。
 
 唯一索引要注意 SQLite 的空串：模型里 `Email string`（不是 `*string`）时 GORM
 插入的是 `''` 而不是 NULL，两个空串会被唯一索引判成冲突。所以索引要写成部分

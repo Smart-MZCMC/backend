@@ -37,7 +37,14 @@ func init() {
 	//
 	// 长度必须是 32，框架长度不对时直接 os.Exit(0)——在测试里表现为「进程
 	// 消失、没有任何输出」，极难定位。
-	setIfAbsent("APP_KEY", "test-app-key-0123456789abcdef")
+	//
+	// 这个值以前写成 29 位。它当下并不会炸：app/setup 在自己的 init 里（早于
+	// config 读配置）就把 <包目录>/.env 生成出来了，APP_KEY 是随机 32 位，而
+	// .env 文件的优先级高于环境变量，于是那 29 位从来没被真正用上。但它是个埋着
+	// 的雷——哪天 app/setup 不再往测试目录写 .env（inTestBinary 现在其实拦不住，
+	// 见 app/setup/setup.go），或者有人照着注释里的「32 位」去核对，这行就会变成
+	// 静默退出的原因，而症状是「go test 进程凭空消失」。
+	setIfAbsent("APP_KEY", "testappkey0123456789abcdefghij12")
 	setIfAbsent("JWT_SECRET", "test-jwt-secret-0123456789abcdef")
 	setIfAbsent("DB_CONNECTION", "sqlite")
 

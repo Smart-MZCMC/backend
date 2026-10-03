@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 
 	"github.com/casbin/casbin/v2"
 
@@ -45,6 +46,32 @@ import (
 //	                  理由：运行中退回 embedded 是一次静默的全系统降权，
 //	                  它比「这次改动没生效」严重得多。
 
+// policyWriter 串行化**策略的写入**：ApplyRolePermissions 与 Reload 都走它。
+//
+// 为什么需要：ApplyRolePermissions 是「算差集 → 写库 → 重载 → 必要时回滚」
+// 这一整串，中间有至少两次读策略表。没有它，两个管理员同时改权限会这样：
+//
+//	A 读到起点 S，算出自己相对 S 的增删
+//	B 也读到起点 S，算出自己相对 S 的增删
+//	A 写库、重载；B 写库、重载
+//
+// 于是**两次审计都说自己相对 S 改了某几项**，而实际发生的是 B 覆盖掉了 A。
+// 出事故时要回答的第一个问题恰恰是「谁多了一项能力」，而审计在这条路径上
+// 会答错。反过来，B 若能读到 A 刚写下的那份，他报的 revoked 就必然包含
+// A 的那一项——那才是实情。
+//
+// 顺带解决的两件事：
+//
+//   - 写库与重载之间的窗口不再有两个写者交叉，SQLite 上「读库撞上另一个
+//     写者的提交」而拿到 SQLITE_BUSY 的机会随之下降。
+//   - 「改动生效了吗」变成一个**原子步骤**：要么整串做完且内存与库一致，
+//     要么整串回滚。读路径（Can/View）不碰这把锁，所以受守卫的请求不会被
+//     写路径卡住——锁只串行化本来就已经很稀有的写操作。
+//
+// 它**不是**用来防越权的：三条 Validate* 在拿锁之前就跑完了，那才是防越权的
+// 那一层。这把锁只保证「写与写之间不打架」。
+var policyWriter sync.Mutex
+
 const (
 	// SourceEmbedded 表示当前生效的策略来自 go:embed 的 policy.csv。
 	//
@@ -80,8 +107,16 @@ func Bootstrap() {
 		installEmbedded("未装配策略存储，当前使用内嵌 policy.csv")
 		return
 	}
-	if err := Reload(); err != nil {
-		installEmbedded("策略表不可用（" + err.Error() + "），已退回内嵌 policy.csv")
+	policyWriter.Lock()
+	err := reloadLocked()
+	policyWriter.Unlock()
+	if err != nil {
+		// 刻意把**原始错误**原样说出来，而不是笼统地说「策略表不可用」：
+		// Reload 也会因为「库里的策略违反受保护规则」而失败（ErrCodeConflict），
+		// 那不是表坏了，是有人绕过本项目改过数据。两种原因要查的地方完全不同，
+		// 而启动时正是最不该含糊的时刻。
+		installEmbedded("未能从 role_permissions 装载策略（" + err.Error() +
+			"），已退回内嵌 policy.csv")
 		return
 	}
 	log.Printf("[RBAC] 策略已从 %s 装载：%d 项权限 / %d 个角色",
@@ -97,6 +132,16 @@ func Bootstrap() {
 // 表为空时会先用 policy.csv 播种一次（见 seedIfEmpty）。这条让「初始化向导
 // 跑完迁移但进程没重启」这种情况不需要人来管：下一个请求就会把表填上。
 func Reload() error {
+	policyWriter.Lock()
+	defer policyWriter.Unlock()
+	return reloadLocked()
+}
+
+// reloadLocked 是 Reload 的本体，**调用方必须已经持有 policyWriter**。
+//
+// 拆成两个是因为 ApplyRolePermissions 在自己的临界区里要重载：让 Reload
+// 再去拿一次同一把锁就是自死锁。
+func reloadLocked() error {
 	s := currentStore()
 	if s == nil {
 		return &PolicyError{
@@ -144,17 +189,34 @@ func Reload() error {
 	return nil
 }
 
-// installEmbedded 退回内嵌 policy.csv，并记下原因。
+// installEmbedded 装上内嵌 policy.csv，并记下原因。
 //
 // 它是「策略表坏了也不要停播」这条设计里唯一的退路，所以必须把自己降级这件事
 // 说出来：日志里一行、GET /api/rbac/policy 的 warnings 里一条。悄悄退回是
 // 最坏的一种——它会让管理员以为自己在改数据库里的策略，而其实下一次重载就
 // 会把它们全部覆盖掉。
+//
+// ⚠️ 它**真的会把内嵌策略装进内存**，而不是只把 source 标成 embedded。
+// 只标不装是一句谎：Bootstrap 在表读不出来时调用它，而那一刻内存里若是上一次
+// 从库里装来的策略，那么报出来的 source（embedded）与实际生效的那份会对不上。
+// 那种谎的代价是管理员按错误的依据做判断，而这里只要多构造一个 Enforcer
+// （内嵌那份在任何路径下都不会超过 41 行）就能让它变成真的。
+//
+// 内嵌策略自己加载失败时**保留原来那一份**：fail-closed 要保留「上一份可用的」，
+// 而不是把自己清空成 nil（那会让 Can 对一切返回 false，把一次退避变成停播）。
 func installEmbedded(reason string) {
 	log.Printf("[RBAC] %s", reason)
+	e, err := load(modelConf, policyCSV)
+	if err != nil {
+		log.Printf("[RBAC] 内嵌策略加载失败，保留当前生效的策略不动：%v", err)
+	}
+	notes := embeddedWarnings(e)
 	active.Lock()
+	if err == nil {
+		active.enforcer = e
+	}
 	active.source = SourceEmbedded
-	active.warnings = append([]string{reason}, embeddedWarnings(activeEnforcer())...)
+	active.warnings = append([]string{reason}, notes...)
 	active.Unlock()
 }
 
@@ -220,18 +282,39 @@ type PolicyView struct {
 }
 
 // View 返回当前生效策略的完整快照。
+//
+// ⚠️ 这里**一次性**取快照（take），然后所有字段都从那一份上算。写成
+// 「Source() + Warnings() + 96 次 Can + 8 次 PermissionsOf」在功能上也对，
+// 但那是一次字段一次取锁：一次 Reload 落在中间就会拼出一份半份快照——
+// source 是旧策略的、holders 是新策略的。它不是数据竞争（race detector 看不见），
+// 而后果是界面渲染出来的矩阵与实际放行对不上，管理员会照着它反复勾选。
+//
+// concurrency_test.go 的 TestView_快照不掺半份策略 钉住这一条。
+//
+// ⚠️ **刻意不去优化成「按 permissionsOf 推 holders」**：那确实快一个数量级
+// （8 次 PermissionsOf ≈ 14µs，而 96 次 Enforce ≈ 1.6ms，见 bench_test.go），
+// 但它把「从生效中的策略现算」换成了「在 Go 侧复现一遍 model.conf 的语义」。
+// 本包的 model.conf 是全等匹配，所以两者今天完全等价；哪天它变成 keyMatch，
+// permissionsOf 与 Enforce 就会分叉，而界面照旧显示正常——那正是这段代码
+// 存在的理由要防的事。1.6ms 是一次页面打开的成本，不是热路径，热路径是
+// Can（20µs/次），而 Can 不需要现算整张表。
 func View() PolicyView {
+	snap := take()
 	view := PolicyView{
-		Source:      Source(),
-		Warnings:    Warnings(),
+		Source:      snap.source,
+		Warnings:    snap.warnings,
 		Permissions: make([]PermissionView, 0, len(permissionNames)),
 		Roles:       make([]RoleView, 0, len(models.AllRoles())),
+	}
+	if view.Warnings == nil {
+		// nil 会被 JSON 编成 null，前端 for...of 遇到 null 直接报错。
+		view.Warnings = []string{}
 	}
 
 	for _, perm := range AllPermissions() {
 		holders := make([]string, 0, len(models.AllRoles()))
 		for _, role := range models.AllRoles() {
-			if Can(role, perm) {
+			if snap.enforce(role, perm) {
 				holders = append(holders, string(role))
 			}
 		}
@@ -244,11 +327,10 @@ func View() PolicyView {
 	}
 
 	for _, role := range models.AllRoles() {
-		grants := PermissionsOf(role)
+		grants := snap.permissionsOf(role)
 		if grants == nil {
-			// nil 会被 JSON 编成 null，前端拿到 null 之后 for...of 直接报错。
-			// 这里给一个空数组：权限为空是合法状态（虽然不健康），
-			// 而「读不出来」由 warnings 去说。
+			// 同上：权限为空是合法状态（虽然不健康），而「读不出来」由
+			// warnings 去说。
 			grants = []string{}
 		}
 		view.Roles = append(view.Roles, RoleView{
@@ -313,7 +395,7 @@ func matrixWarnings(matrix Matrix) []string {
 // 策略静悄悄地不同——而 policy.csv 正是 code review 时被人看的那一份。
 // 从 Enforcer 反推则保证「播下去的」与「跑着的」逐字一致。
 func embeddedMatrix() (Matrix, error) {
-	// 刻意**重新 load 一次**而不是读 activeEnforcer()：那个是「当前生效的
+	// 刻意**重新 load 一次**而不是读 currentEnforcer()：那个是「当前生效的
 	// 策略」，可能来自数据库，也可能已经被在线编辑改过。而播种用的模板必须
 	// 永远等于仓库里那一份 policy.csv。
 	//
@@ -381,12 +463,26 @@ func enforcerFromMatrix(matrix Matrix) (*casbin.Enforcer, error) {
 }
 
 // Change 是一次权限变更的结果。
+//
+// ⚠️ Granted 与 Revoked **必须**始终是非 nil 切片，即使本次什么都没变。
+//
+// 这不是洁癖：encoding/json 把 nil 切片编成 null，而它们会同时出现在
+// PUT /api/rbac/roles/:role/permissions 的**响应体**与 audit_logs 的 detail 里。
+// null 在 JS 里既没有 .length 也没有 .map，于是前端一句 `res.granted.length`
+// 会在**保存成功的那一瞬**抛 TypeError——后端返回的是 200、策略已经改了，
+// 而界面停在编辑态说「报错了」。那种症状会把排查方向彻底带偏：看起来像
+// 后端把系统改崩了，真正的原因只是「这次没有新增」。
+//
+// 空集合是**合法且有意义的**状态（这次确实什么都没变），所以它必须以 []
+// 出现，而不是以「没有值」出现。构造点只有 ApplyRolePermissions 一处，
+// 那里的字面量必须带 make(..., 0)；runtime_test.go 的
+// TestApplyRolePermissions_没有变化时也返回非nil切片 钉住这一点。
 type Change struct {
 	// Role 被改动的角色。
 	Role models.Role
-	// Granted 本次新授予的权限。
+	// Granted 本次新授予的权限。永不为 nil。
 	Granted []string
-	// Revoked 本次被取消的权限。
+	// Revoked 本次被取消的权限。永不为 nil。
 	Revoked []string
 }
 
@@ -412,6 +508,10 @@ func (c *Change) Empty() bool {
 // **任一条不过就整次拒绝，一个字节都不写**：这是「线上没有半成品策略」的
 // 唯一保证。逐条写、逐条报错看起来更友好，但会出现「改了 3 项成功、第 4 项
 // 被拒」的半成品，而受保护规则一旦被半成品破坏，系统就锁死了。
+//
+// 三条 Validate* 在**拿写锁之前**就跑完了（那是纯函数，快且不会阻塞别人）；
+// 拿锁之后那段是「重载 → 算差集 → 写库 → 重载」，中间不 sleep、不做 IO
+// 之外的事，所以它对别的写者的阻塞时间就是一次库读加一次 Enforcer 构造。
 //
 // 写库之后还会 Reload 一次并再核对受保护规则：万一库里的其他角色本来就是坏的
 // （手改过），装载会失败，这时把本次写入回滚并返回错误——宁可这次改动没生效，
@@ -446,21 +546,35 @@ func ApplyRolePermissions(role models.Role, granted []string) (*Change, error) {
 		}
 	}
 
-	// 先确认策略表可用。这一步失败就什么都不做：往一张读不出来的表里
-	// 写权限，写进去的是不是生效的策略谁也说不准。
-	if Source() != SourceDatabase {
-		if err := Reload(); err != nil {
-			return nil, err
-		}
+	// 到这里所有校验都过了。剩下的事在 policyWriter 的临界区里做完：
+	// 重载（拿到一个与库完全一致的基线）→ 算差集 → 写库 → 再重载。
+	//
+	// **先重载再算差集**，而不是「来源不是 database 才重载」：差集必须相对
+	// 这一次**真正替换掉的那一份**来算，否则审计里的 granted/revoked 是在
+	// 一份可能已经过期的基线上算出来的。两次并发改动时，后写的那一次就会
+	// 漏报前一次加的那一项——而「谁多了一项能力」正是出事故时要回答的第一个
+	// 问题。顺带它也把「来源是 database 但存储其实是 nil」那种组合彻底消掉：
+	// 原来那种组合会在 currentStore().ReplaceRole 上 panic（nil 接口调用）。
+	policyWriter.Lock()
+	defer policyWriter.Unlock()
+
+	// 重载失败（表读不出来、库里那份违反受保护规则）就什么都不做：往一张
+	// 读不出来、或装不回来的表里写权限，写进去的是不是生效的策略谁也说不准。
+	if err := reloadLocked(); err != nil {
+		return nil, err
 	}
 
-	current := PermissionsOf(role)
-
+	// 这一行必须在 policyWriter 临界区里取：它就是本次改动**真正替换掉的那一份**
+	// ——上面那次重载保证它与 role_permissions 表逐格一致。
+	current := currentEnforcerSnapshot().permissionsOf(role)
 	have := map[string]bool{}
 	for _, perm := range current {
 		have[perm] = true
 	}
-	change := &Change{Role: role}
+	// 两个字段都显式给非 nil 的空切片：本次「什么都没变」是完全正常的
+	// 结果，而 nil 会被 JSON 编成 null，前端读它的 .length 就崩
+	// （见 Change 的说明）。
+	change := &Change{Role: role, Granted: []string{}, Revoked: []string{}}
 	for _, perm := range current {
 		if !want[perm] {
 			change.Revoked = append(change.Revoked, perm)
@@ -480,13 +594,20 @@ func ApplyRolePermissions(role models.Role, granted []string) (*Change, error) {
 	// 到这里所有校验都过了，剩下的事只有一件：把集合整体写下去。
 	// 刻意不做「逐项增删」——那是两次写、中间有一个可观测的半成品状态，
 	// 而一次 ReplaceRole 在事务里要么全成要么全不成。
-	if err := currentStore().ReplaceRole(role, normalized); err != nil {
+	s := currentStore()
+	if s == nil {
+		return nil, &PolicyError{
+			Code:    ErrCodeUnavailable,
+			Message: "策略存储未装配，无法写入权限",
+		}
+	}
+	if err := s.ReplaceRole(role, normalized); err != nil {
 		return nil, &PolicyError{
 			Code:    ErrCodeUnavailable,
 			Message: "写入 role_permissions 失败：" + err.Error(),
 		}
 	}
-	if err := Reload(); err != nil {
+	if err := reloadLocked(); err != nil {
 		rollbackRolePermissions(role, current)
 		return nil, err
 	}
@@ -495,10 +616,18 @@ func ApplyRolePermissions(role models.Role, granted []string) (*Change, error) {
 
 // rollbackRolePermissions 把某角色的权限集合写回旧值并重新装载。
 //
+// **调用方必须已经持有 policyWriter**。
+//
 // 回滚本身也可能失败（磁盘满了、表被锁了）。那时候只记日志：
-// 内存里仍然是上一份可用策略（Reload 失败时不动内存），所以系统的行为还是
+// 内存里仍然是上一份可用策略（重载失败时不动内存），所以系统的行为还是
 // 对的，错的只是库里那份数据——而它已经被 warnings 与这条错误日志指出来了。
 // 再往上抛一个错误只会让调用方以为「什么都没发生」，反而更危险。
+//
+// ⚠️ 回滚失败**不构成「重启即中招」的后门**：它意味着库里留着的那份改动
+// 违反受保护规则，而下次进程启动时 Bootstrap → reloadLocked 用的是同一个
+// protectedRuleFindings，一样会拒绝装载它，于是启动路径照样 fail-closed。
+// runtime_test.go 的 TestApplyRolePermissions_回滚失败后重启不会装上违规策略
+// 钉住这一条。
 func rollbackRolePermissions(role models.Role, previous []string) {
 	log.Printf("[RBAC] 正在回滚 %s 的权限：本次写入导致重载失败", role.Label())
 	s := currentStore()
@@ -511,7 +640,7 @@ func rollbackRolePermissions(role models.Role, previous []string) {
 			"请按 README「权限策略锁死时的离线恢复」处理：%v", role.Label(), err)
 		return
 	}
-	if err := Reload(); err != nil {
+	if err := reloadLocked(); err != nil {
 		log.Printf("[RBAC] 回滚后重新装载仍然失败，生效中的仍是上一份策略：%v", err)
 		return
 	}

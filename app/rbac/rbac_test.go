@@ -579,9 +579,7 @@ func TestLabel_每项权限都有中文说明(t *testing.T) {
 // 那正是本次要堵掉的东西。bypass_test.go 断言 rbac 包的导出符号里
 // 没有任何一个提到 casbin —— 那条断言就是这里「只在包内」的理由。
 func loadedPolicy() *casbin.Enforcer {
-	active.RLock()
-	defer active.RUnlock()
-	return activeEnforcer()
+	return currentEnforcer()
 }
 
 // permissionsOf 从**策略本身**读出某角色的权限清单。
@@ -645,6 +643,27 @@ func withPolicy(t *testing.T, e *casbin.Enforcer) {
 		active.enforcer = saved
 		active.Unlock()
 	})
+}
+
+// silenceB 是 silenceLog 的 benchmark 版本。
+//
+// 基准里同样要闭嘴：Can 对每一次拒绝都打日志，而 View() 内部有 96 次 Can，
+// 不闭嘴的话量到的是 log.Printf 的时间而不是策略计算的时间。
+func silenceB(b *testing.B) {
+	b.Helper()
+	saved := log.Writer()
+	log.SetOutput(io.Discard)
+	b.Cleanup(func() { log.SetOutput(saved) })
+}
+
+// mustEmbeddedMatrix 是 embeddedMatrix 的 fatal-on-error 版，给基准用。
+func mustEmbeddedMatrix(b *testing.B) Matrix {
+	b.Helper()
+	m, err := embeddedMatrix()
+	if err != nil {
+		b.Fatalf("读内嵌策略失败：%v", err)
+	}
+	return m
 }
 
 // silenceLog 把标准日志输出丢掉，用例结束后恢复。
