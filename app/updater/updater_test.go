@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -533,5 +534,57 @@ func TestFetchAsset_ChecksumURLDoesNotAffectOtherAssets(t *testing.T) {
 	}
 	if string(body) != "asset-from-mirror" || mirrorHits != 1 || trustHits != 0 {
 		t.Fatalf("普通资产必须走镜像: body=%q mirror=%d trust=%d", body, mirrorHits, trustHits)
+	}
+}
+
+// Check 把 Release 正文（更新详情）一起带出来。
+//
+// 这条规则防的是「更新详情永远是空的」：fetchLatest 早就把 body 解出来了，
+// 但 CheckResult 没有对应字段，于是管理后台的「更新详情」区只能显示
+// 「暂无」——而运维点「应用更新」之前最需要看的恰恰是这次改了什么。
+func TestCheck_带出Release正文作为更新详情(t *testing.T) {
+	notes := "## 1.6.3\n\n### 修掉某处\n\n正文里有 `代码` 与 <script>alert(1)</script>"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"tag_name": "v1.6.3",
+			"name": "v1.6.3",
+			"body": ` + strconv.Quote(notes) + `,
+			"published_at": "2026-10-04T00:00:00Z",
+			"html_url": "https://example.invalid/r/v1.6.3",
+			"assets": [{"name": "backend-linux-amd64.tar.gz", "size": 1, "browser_download_url": "https://example.invalid/a"}]
+		}`))
+	}))
+	defer srv.Close()
+
+	u := New(Config{Enabled: true, Repo: "o/r", Asset: "backend-linux-amd64.tar.gz", Server: srv.URL}, nil)
+	res := u.Check("1.6.2")
+
+	if res.LatestVersion != "1.6.3" {
+		t.Fatalf("LatestVersion = %q, 期望 1.6.3", res.LatestVersion)
+	}
+	if res.ReleaseNotes != notes {
+		t.Fatalf("ReleaseNotes 未原样送达：\n得到 %q\n期望 %q", res.ReleaseNotes, notes)
+	}
+	// 原样送达是硬要求：正文里含 HTML 时，后端一个字节都不能加工，
+	// 否则「转义」这件事就不知道该由谁负责了。
+	if !strings.Contains(res.ReleaseNotes, "<script>") {
+		t.Error("ReleaseNotes 被加工过：正文里的原始标记应当原样透传，转义交给前端")
+	}
+}
+
+func TestCheck_未启用或取不到时不带正文(t *testing.T) {
+	u := New(Config{Enabled: false, Repo: "o/r", Asset: "x"}, nil)
+	if res := u.Check("1.6.2"); res.ReleaseNotes != "" {
+		t.Errorf("未启用时 ReleaseNotes = %q, 期望空", res.ReleaseNotes)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	u2 := New(Config{Enabled: true, Repo: "o/r", Asset: "x", Server: srv.URL}, nil)
+	if res := u2.Check("1.6.2"); res.ReleaseNotes != "" {
+		t.Errorf("取不到 Release 时 ReleaseNotes = %q, 期望空", res.ReleaseNotes)
 	}
 }

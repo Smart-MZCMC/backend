@@ -408,6 +408,36 @@ jobs:
           sha256sum *.tar.gz *.apk > checksums.txt
           cat checksums.txt
 
+      # 把 CHANGELOG.md 里本次版本的那一节抽出来，作为 Release 正文的前半段。
+      #
+      # 为什么需要：下面 body 里写死的那段部署说明是固定的，**不含「这次改了什么」**，
+      # 而 generate_release_notes 只在页面底部给一条 compare 链接。后端的更新检查本来
+      # 就把整个 body 取回去了，管理后台要拿它当「更新详情」展示——运维点「应用更新」
+      # 之前得知道这次有没有新配置项、客户端要不要重新编译。所以正文里必须真的有这
+      # 部分内容，而不是让前端再发一次请求去猜。
+      #
+      # 只取第一个 `## ` 章节：CHANGELOG.md 顶部就是最新版本，遇到下一个就停。
+      # 老版本不该出现在本次更新的说明里。
+      - name: Extract changelog for this release
+        id: changelog
+        run: |
+          set -euo pipefail
+          notes=$(awk '/^## /{ if (started) exit; started=1 } started' CHANGELOG.md \
+                  | sed '/./,$!d' | sed -e 's/[[:space:]]*$//')
+          if [ -z "$notes" ]; then
+            echo "::warning::CHANGELOG.md 里找不到版本章节，正文将只有部署说明"
+            notes="（本次发布未提供更新内容）"
+          fi
+          # 多行 output 必须用分隔符写法，且分隔符要随机——CHANGELOG.md 里如果恰好
+          # 出现定值分隔符那行，后面的内容就会被截断。
+          delim="EOF_$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          {
+            printf 'notes<<%s\n' "$delim"
+            printf '%s\n' "$notes"
+            printf '%s\n' "$delim"
+          } >> "$GITHUB_OUTPUT"
+          echo "已抽取 ${#notes} 字符的更新内容"
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -422,6 +452,10 @@ jobs:
           draft: false
           generate_release_notes: true
           body: |
+            ${{ steps.changelog.outputs.notes }}
+
+            ---
+
             ## 部署
 
             下载 `backend-linux-amd64.tar.gz`：

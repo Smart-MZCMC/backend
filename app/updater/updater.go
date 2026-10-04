@@ -107,7 +107,12 @@ type CheckResult struct {
 	PublishedAt    string `json:"published_at,omitempty"`
 	ReleaseURL     string `json:"release_url,omitempty"`
 	Size           int64  `json:"size,omitempty"`
-	Error          string `json:"error,omitempty"`
+	// ReleaseNotes 是该版本的发布正文（Markdown 原文，未加工）。
+	//
+	// 不可信：来自 UPDATE_API_BASE 指向的更新源，可以是镜像。前端渲染它时
+	// 必须先转义再套用白名单，绝不能当 HTML 注入。
+	ReleaseNotes string `json:"release_notes,omitempty"`
+	Error        string `json:"error,omitempty"`
 }
 
 // ApplyResult 是一次更新的执行结果。
@@ -300,6 +305,14 @@ func (u *Updater) Check(current string) CheckResult {
 	res.LatestVersion = latest
 	res.PublishedAt = rel.PublishedAt
 	res.ReleaseURL = rel.HTMLURL
+	// Release 正文本来就已经取回来了（fetchLatest 解的是同一个 release 结构），
+	// 之前只是没往外送。更新详情要的就是它——运维在点「应用更新」之前需要知道
+	// 这次会不会有新配置项、客户端要不要重新编译。
+	//
+	// 这里不做任何加工：正文是 Markdown，且来自 UPDATE_API_BASE 指向的更新源
+	// （可以是镜像），属于不可信输入。要不要渲染、怎么渲染，由前端负责，
+	// 后端只负责原样送达。
+	res.ReleaseNotes = rel.Body
 
 	asset := findAsset(rel, u.cfg.Asset)
 	if asset == nil {
